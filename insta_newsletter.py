@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import time
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +39,22 @@ class Post:
             self.taken_at_timestamp, tz=timezone.utc
         ).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
 
+
+def ensure_profiles_file():
+    profiles_path = Path("profiles.txt")
+    example_path = Path("profiles.example.txt")
+
+    if not profiles_path.exists():
+        if example_path.exists():
+            shutil.copy(example_path, profiles_path)
+            print(
+                "Created profiles.txt from profiles.example.txt. "
+                "Edit profiles.txt to add the accounts you want to monitor."
+            )
+        else:
+            raise FileNotFoundError(
+                "profiles.txt not found and profiles.example.txt is missing."
+            )
 
 def read_profiles(path: str) -> list[str]:
     lines = Path(path).read_text(encoding="utf-8").splitlines()
@@ -174,6 +191,7 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
 
 
 def main() -> int:
+    ensure_profiles_file()
     start_time=time.time()
     try:
         profile_urls = read_profiles(PROFILES_FILE)
