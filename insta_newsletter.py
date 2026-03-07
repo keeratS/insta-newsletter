@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import sys
 import time
@@ -190,18 +191,18 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
     return data["message"]["content"]
 
 
-def main() -> int:
+def generate_newsletter() -> tuple[str, float, int, int]:
     ensure_profiles_file()
-    start_time=time.time()
+    start_time = time.time()
     try:
         profile_urls = read_profiles(PROFILES_FILE)
     except FileNotFoundError:
-        print(f"Missing {PROFILES_FILE}. Create it with one Instagram profile URL per line.", file=sys.stderr)
-        return 1
+        raise FileNotFoundError(
+            f"Missing {PROFILES_FILE}. Create it with one Instagram profile URL per line."
+        )
 
     if not profile_urls:
-        print(f"{PROFILES_FILE} is empty.", file=sys.stderr)
-        return 1
+        raise ValueError(f"{PROFILES_FILE} is empty.")
 
     accounts_checked = len(profile_urls) 
     
@@ -228,13 +229,11 @@ def main() -> int:
                 print(f"401 error while fetching {profile_url}", file=sys.stderr)
 
                 if consecutive_401_errors >= 3:
-                    print(
-                        "\nFYI: Multiple authentication errors detected while contacting Instagram.\n"
-                        "Instagram may be rate limiting requests from your IP address.\n"
-                        "Please wait a few minutes before running the script again.\n",
-                        file=sys.stderr,
+                    raise RuntimeError(
+                        "Multiple authentication errors detected while contacting Instagram. "
+                        "Instagram may be rate limiting requests from your IP address. "
+                        "Please wait a few minutes before running the script again."
                     )
-                    return 1 # do not continue to model
 
             else:
                 print(f"HTTP error for {profile_url}: {e}", file=sys.stderr)
@@ -250,10 +249,16 @@ def main() -> int:
 
     end_time = time.time()
     elapsed = end_time - start_time
-    runtime = f"{elapsed:.2f}"
+    return summary, elapsed, accounts_checked, accounts_with_posts
 
-    print(summary)
-    
+
+def main() -> int:
+    try:
+        summary, elapsed, accounts_checked, accounts_with_posts = generate_newsletter()
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
     print(summary)
 
     print("\n---")

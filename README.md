@@ -89,6 +89,11 @@ https://www.instagram.com/litquake/
 ```
 Add one profile per line.
 
+Set a Readwise token to send generated newsletters to your Readwise feed:
+```
+export READWISE_ACCESS_TOKEN="your_readwise_access_token"
+```
+
 ---
 
 ## Usage
@@ -97,12 +102,22 @@ Run the script:
 ```
 python insta_newsletter.py
 ```
-The script will:
+This script will:
 
 - fetch recent posts
 - extract captions
 - send them to the LLM
 - print a newsletter-style summary
+
+Run the wrapper to generate and then send to Readwise:
+```
+python send_readwise_insta_newsletter.py
+```
+This wrapper will:
+
+- call `insta_newsletter` newsletter generation
+- send the generated summary to Readwise via `POST /api/v3/save/`
+- fail if `READWISE_ACCESS_TOKEN` is not set
 
 ---
 
