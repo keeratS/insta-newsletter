@@ -7,7 +7,7 @@ A small Python tool that monitors Instagram profiles, extracts captions from pos
 This project is designed to run locally and can be scheduled with a cron job to generate periodic summaries.
 
 ---
-
+✨🌿☕📸📝🤖📬📝📸☕🌿✨
 # Overview
 
 The script:
@@ -15,15 +15,14 @@ The script:
 1. Reads a list of Instagram profiles from a file
 2. Fetches recent posts from each profile
 3. Extracts captions from posts within a specified time window
-4. Sends the captions to a local LLM via **Ollama**
+4. Sends the captions to a local LLM via Ollama
 5. Produces a concise newsletter-style summary
 
 Example use cases:
 
 - monitoring community organizations
 - tracking local businesses or events
-- generating internal updates
-- experimenting with LLM summarization pipelines
+- reducing personal reliance on instagram app
 
 ---
 
