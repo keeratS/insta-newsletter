@@ -64,7 +64,7 @@ ollama pull qwen3:8b
 
 ### Clone the repository
 ```
-git clone https://github.com/yourusername/insta-newsletter.git
+git clone https://github.com/keeratS/insta-newsletter.git
 cd insta-newsletter
 ```
 ### Create a virtual environment
