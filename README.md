@@ -56,7 +56,7 @@ https://ollama.com
 
 Pull a model:
 ```
-ollama pull llama3.2
+ollama pull qwen3:8b
 ```
 ---
 
@@ -136,6 +136,7 @@ Example (every 3 days):
 - This project summarizes captions only.
 - Image analysis could be added using a multimodal model such as qwen2.5vl.
 - Instagram endpoints may change over time.
+- currently tested with qwen3:8b on macbook m4 pro
 
 ---
 
