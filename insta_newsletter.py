@@ -21,6 +21,9 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "qwen3:8b"
 LOOKBACK_DAYS = 3
 PROFILES_FILE = "profiles.txt"
+INSTAGRAM_CACHE_DIR = Path(".cache/instagram_profiles")
+INSTAGRAM_CACHE_TTL_SECONDS = 3 * 60 * 60
+INSTAGRAM_CACHE_MAX_AGE_SECONDS = 3 * 60 * 60
 
 
 @dataclass
@@ -85,6 +88,73 @@ def fetch_profile_json(username: str) -> dict[str, Any]:
     response = requests.get(url, headers=headers, timeout=60)
     response.raise_for_status()
     return response.json()
+
+
+def _cache_file_for_username(username: str) -> Path:
+    safe_username = re.sub(r"[^a-zA-Z0-9_.-]", "_", username)
+    return INSTAGRAM_CACHE_DIR / f"{safe_username}.json"
+
+
+def _write_profile_cache(username: str, profile_json: dict[str, Any]) -> None:
+    INSTAGRAM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_payload = {
+        "username": username,
+        "fetched_at": int(time.time()),
+        "profile_json": profile_json,
+    }
+    _cache_file_for_username(username).write_text(
+        json.dumps(cache_payload), encoding="utf-8"
+    )
+
+
+def _read_profile_cache(
+    username: str, *, max_age_seconds: int
+) -> dict[str, Any] | None:
+    cache_file = _cache_file_for_username(username)
+    if not cache_file.exists():
+        return None
+
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        fetched_at = int(payload.get("fetched_at", 0))
+        profile_json = payload.get("profile_json")
+    except Exception:
+        return None
+
+    if not isinstance(profile_json, dict):
+        return None
+
+    age_seconds = int(time.time()) - fetched_at
+    if age_seconds > max_age_seconds:
+        return None
+    return profile_json
+
+
+def prune_old_profile_cache_files(max_age_seconds: int) -> int:
+    if not INSTAGRAM_CACHE_DIR.exists():
+        return 0
+
+    deleted = 0
+    now = int(time.time())
+    for cache_file in INSTAGRAM_CACHE_DIR.glob("*.json"):
+        should_delete = False
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            fetched_at = int(payload.get("fetched_at", 0))
+            if fetched_at <= 0:
+                fetched_at = int(cache_file.stat().st_mtime)
+            should_delete = (now - fetched_at) > max_age_seconds
+        except Exception:
+            should_delete = True
+
+        if should_delete:
+            try:
+                cache_file.unlink()
+                deleted += 1
+            except OSError:
+                pass
+
+    return deleted
 
 
 def extract_recent_posts(profile_json: dict[str, Any], username: str, lookback_days: int) -> list[Post]:
@@ -193,6 +263,12 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
 
 def generate_newsletter() -> tuple[str, float, int, int]:
     ensure_profiles_file()
+    pruned_cache_files = prune_old_profile_cache_files(
+        INSTAGRAM_CACHE_MAX_AGE_SECONDS
+    )
+    if pruned_cache_files:
+        print(f"Pruned {pruned_cache_files} old Instagram cache file(s).", file=sys.stderr)
+
     start_time = time.time()
     try:
         profile_urls = read_profiles(PROFILES_FILE)
@@ -213,7 +289,18 @@ def generate_newsletter() -> tuple[str, float, int, int]:
     for profile_url in profile_urls:
         try:
             username = extract_username(profile_url)
+            profile_json = _read_profile_cache(
+                username, max_age_seconds=INSTAGRAM_CACHE_TTL_SECONDS
+            )
+            if profile_json is not None:
+                print(f"Using cached @{username} profile data", file=sys.stderr)
+                posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
+                posts_by_user[username] = posts
+                consecutive_401_errors = 0
+                continue
+
             profile_json = fetch_profile_json(username)
+            _write_profile_cache(username, profile_json)
             posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
             posts_by_user[username] = posts
 
@@ -227,6 +314,19 @@ def generate_newsletter() -> tuple[str, float, int, int]:
             if e.response.status_code == 401:
                 consecutive_401_errors += 1
                 print(f"401 error while fetching {profile_url}", file=sys.stderr)
+
+                stale_profile_json = _read_profile_cache(
+                    username, max_age_seconds=INSTAGRAM_CACHE_MAX_AGE_SECONDS
+                )
+                if stale_profile_json is not None:
+                    posts = extract_recent_posts(stale_profile_json, username, LOOKBACK_DAYS)
+                    posts_by_user[username] = posts
+                    consecutive_401_errors = 0
+                    print(
+                        f"Using stale cached @{username} data due to Instagram 401.",
+                        file=sys.stderr,
+                    )
+                    continue
 
                 if consecutive_401_errors >= 3:
                     raise RuntimeError(

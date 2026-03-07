@@ -128,6 +128,20 @@ The wrapper will:
 
 ---
 
+## Caching
+
+Instagram profile responses are cached on disk to reduce repeated API calls and lower the chance of rate-limit/auth errors.
+
+- cache path: `.cache/instagram_profiles/`
+- fresh cache window: 3 hours
+- stale fallback window on Instagram `401`: 3 hours
+- old cache files are pruned automatically during runs
+
+To clear cache manually, delete the `.cache/instagram_profiles` folder.
+The folder is recreated automatically on the next run.
+
+---
+
 ## Running Automatically
 
 You can run the script periodically using cron.
