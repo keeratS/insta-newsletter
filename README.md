@@ -50,31 +50,32 @@ Several Bay Area organizations shared updates this week. Litquake and Lit Crawl 
 - A local LLM model (for example `llama3.2` or `qwen3`)
 
 Install Ollama:
-
+```
 https://ollama.com
+```
 
 Pull a model:
-
+```
 ollama pull llama3.2
-
+```
 ---
 
 ## Installation
 
 ### Clone the repository
-
+```
 git clone https://github.com/yourusername/insta-newsletter.git
 cd insta-newsletter
-
+```
 ### Create a virtual environment
-
+```
 python3 -m venv venv
 source venv/bin/activate
-
+```
 ### Install dependencies
-
+```
 pip install requests
-
+```
 ---
 
 ## Configuration
@@ -82,10 +83,10 @@ pip install requests
 Profiles are stored in a separate file.
 
 Create profiles.txt:
-
+```
 https://www.instagram.com/officialelaichico/
 https://www.instagram.com/litquake/
-
+```
 Add one profile per line.
 
 ---
@@ -93,9 +94,9 @@ Add one profile per line.
 ## Usage
 
 Run the script:
-
+```
 python insta_newsletter.py
-
+```
 The script will:
 
 - fetch recent posts
@@ -110,9 +111,9 @@ The script will:
 You can run the script periodically using cron.
 
 Example (every 3 days):
-
+```
 0 9 */3 * * cd /path/to/project && ./venv/bin/python insta_newsletter.py
-
+```
 ---
 
 ## Notes
