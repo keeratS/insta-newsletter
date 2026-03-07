@@ -150,6 +150,16 @@ Example (every 3 days):
 ```
 0 9 */3 * * cd /path/to/project && ./venv/bin/python insta_newsletter.py
 ```
+
+To refresh only Instagram caches (no newsletter generation), run:
+```
+python refresh_instagram_cache.py
+```
+
+Example cron (twice daily cache refresh):
+```
+0 9,21 * * * cd /path/to/project && ./venv/bin/python refresh_instagram_cache.py
+```
 ---
 
 ## Notes
@@ -157,7 +167,7 @@ Example (every 3 days):
 - This project summarizes captions only.
 - Image analysis could be added using a multimodal model such as qwen2.5vl.
 - Instagram endpoints may change over time.
-- currently tested with qwen3:8b on macbook m4 pro
+- currently tested with qwen3:8b, qwen3:14b on macbook m4 pro
 
 ---
 

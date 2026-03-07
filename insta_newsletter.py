@@ -5,6 +5,7 @@ import json
 import random
 import re
 import sys
+import threading
 import time
 import shutil
 from dataclasses import dataclass
@@ -24,12 +25,28 @@ PROFILES_FILE = "profiles.txt"
 INSTAGRAM_CACHE_DIR = Path(".cache/instagram_profiles")
 INSTAGRAM_CACHE_TTL_SECONDS = 3 * 60 * 60
 INSTAGRAM_CACHE_MAX_AGE_SECONDS = 3 * 60 * 60
+INSTAGRAM_DEPRIORITIZE_CACHE_AGE_SECONDS = 24 * 60 * 60
+INSTAGRAM_REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.instagram.com/",
+    "Origin": "https://www.instagram.com",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "x-ig-app-id": INSTAGRAM_APP_ID,
+}
 
 
 @dataclass
 class Post:
     username: str
-    taken_at_timestamp: int
+    taken_at_timestamp: int | None
     caption: str
     shortcode: str
 
@@ -39,6 +56,8 @@ class Post:
 
     @property
     def taken_at_iso(self) -> str:
+        if self.taken_at_timestamp is None:
+            return "Unknown (HTML fallback)"
         return datetime.fromtimestamp(
             self.taken_at_timestamp, tz=timezone.utc
         ).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
@@ -63,10 +82,14 @@ def ensure_profiles_file():
 def read_profiles(path: str) -> list[str]:
     lines = Path(path).read_text(encoding="utf-8").splitlines()
     profiles = []
+    seen: set[str] = set()
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        if line in seen:
+            continue
+        seen.add(line)
         profiles.append(line)
     return profiles
 
@@ -79,15 +102,22 @@ def extract_username(profile_url: str) -> str:
     return path.split("/")[0]
 
 
-def fetch_profile_json(username: str) -> dict[str, Any]:
+def fetch_profile_json(
+    username: str, session: requests.Session | None = None
+) -> dict[str, Any]:
     url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "x-ig-app-id": INSTAGRAM_APP_ID,
-    }
-    response = requests.get(url, headers=headers, timeout=60)
+    if session is None:
+        response = requests.get(url, headers=INSTAGRAM_REQUEST_HEADERS, timeout=60)
+    else:
+        response = session.get(url, timeout=60)
     response.raise_for_status()
     return response.json()
+
+
+def make_instagram_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(INSTAGRAM_REQUEST_HEADERS)
+    return session
 
 
 def _cache_file_for_username(username: str) -> Path:
@@ -155,6 +185,43 @@ def prune_old_profile_cache_files(max_age_seconds: int) -> int:
                 pass
 
     return deleted
+
+
+def rotate_profiles_for_fetch_priority(profile_urls: list[str]) -> list[str]:
+    if not profile_urls:
+        return profile_urls
+
+    start_index = 0
+    start_username = None
+    found_no_recent_cache = False
+
+    for idx, profile_url in enumerate(profile_urls):
+        try:
+            username = extract_username(profile_url)
+        except Exception:
+            start_index = idx
+            found_no_recent_cache = True
+            break
+
+        recent_cache = _read_profile_cache(
+            username, max_age_seconds=INSTAGRAM_DEPRIORITIZE_CACHE_AGE_SECONDS
+        )
+        if recent_cache is None:
+            start_index = idx
+            start_username = username
+            found_no_recent_cache = True
+            break
+
+    if not found_no_recent_cache:
+        return profile_urls
+
+    rotated = profile_urls[start_index:] + profile_urls[:start_index]
+    if start_username:
+        print(
+            f"Fetch priority rotated: starting at @{start_username} (no cache from last 24 hours).",
+            file=sys.stderr,
+        )
+    return rotated
 
 
 def extract_recent_posts(profile_json: dict[str, Any], username: str, lookback_days: int) -> list[Post]:
@@ -229,11 +296,19 @@ Use only the information provided below.
 Do not invent products, events, dates, or claims.
 Group related updates together.
 Prefer concrete updates over vague marketing language.
+Prioritize updates that include specific dates, deadlines, event times, or time windows.
+In each bullet, explicitly name the specific Instagram account(s) the information came from (for example, "@accountname").
+Every bullet must include at least one @account handle.
+If attribution is uncertain, write "@unknown" instead of guessing.
+Do not merge facts across accounts.
 
 Return exactly:
 1. A title line
-2. 3 to 6 bullet points
+2. 3 to 6 bullet points (prefer 3+ if needed to preserve specific details)
 3. A short newsletter paragraph
+
+Bullet format requirement:
+- [@account] concise factual update
 
 Time window: last {lookback_days} days
 
@@ -255,13 +330,32 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
         "keep_alive": "10m",
     }
 
-    response = requests.post(OLLAMA_URL, json=payload, timeout=300)
-    response.raise_for_status()
-    data = response.json()
-    return data["message"]["content"]
+    stop_progress = threading.Event()
+
+    def _progress_printer() -> None:
+        print(
+            f"Generating newsletter with Ollama model '{model}'",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        while not stop_progress.wait(1.0):
+            print(".", end="", file=sys.stderr, flush=True)
+
+    progress_thread = threading.Thread(target=_progress_printer, daemon=True)
+    progress_thread.start()
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
+        response.raise_for_status()
+        data = response.json()
+        return data["message"]["content"]
+    finally:
+        stop_progress.set()
+        progress_thread.join(timeout=1.0)
+        print("", file=sys.stderr)
 
 
-def generate_newsletter() -> tuple[str, float, int, int]:
+def generate_newsletter() -> tuple[str, float, int, int, str]:
     ensure_profiles_file()
     pruned_cache_files = prune_old_profile_cache_files(
         INSTAGRAM_CACHE_MAX_AGE_SECONDS
@@ -280,66 +374,113 @@ def generate_newsletter() -> tuple[str, float, int, int]:
     if not profile_urls:
         raise ValueError(f"{PROFILES_FILE} is empty.")
 
+    prioritized_profile_urls = rotate_profiles_for_fetch_priority(profile_urls)
     accounts_checked = len(profile_urls) 
     
     posts_by_user: dict[str, list[Post]] = {}
 
     consecutive_401_errors = 0
-   
+    reduced_data_mode = False
+    fresh_cache_by_username: dict[str, dict[str, Any]] = {}
     for profile_url in profile_urls:
         try:
-            username = extract_username(profile_url)
-            profile_json = _read_profile_cache(
-                username, max_age_seconds=INSTAGRAM_CACHE_TTL_SECONDS
-            )
-            if profile_json is not None:
-                print(f"Using cached @{username} profile data", file=sys.stderr)
-                posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
-                posts_by_user[username] = posts
-                consecutive_401_errors = 0
-                continue
+            cached_username = extract_username(profile_url)
+        except Exception:
+            continue
+        cached_profile_json = _read_profile_cache(
+            cached_username, max_age_seconds=INSTAGRAM_CACHE_TTL_SECONDS
+        )
+        if cached_profile_json is not None:
+            fresh_cache_by_username[cached_username] = cached_profile_json
+   
+    with make_instagram_session() as instagram_session:
+        for profile_url in prioritized_profile_urls:
+            username: str | None = None
+            try:
+                username = extract_username(profile_url)
 
-            profile_json = fetch_profile_json(username)
-            _write_profile_cache(username, profile_json)
-            posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
-            posts_by_user[username] = posts
-
-            print(f"Fetched @{username}: {len(posts)} recent post(s)", file=sys.stderr)
-
-            # reset counter on success
-            consecutive_401_errors = 0
-            time.sleep(random.uniform(0.5, 1.25)) # wait a bit to not hammer w requests
-
-        except requests.HTTPError as e:
-            if e.response.status_code == 401:
-                consecutive_401_errors += 1
-                print(f"401 error while fetching {profile_url}", file=sys.stderr)
-
-                stale_profile_json = _read_profile_cache(
-                    username, max_age_seconds=INSTAGRAM_CACHE_MAX_AGE_SECONDS
-                )
-                if stale_profile_json is not None:
-                    posts = extract_recent_posts(stale_profile_json, username, LOOKBACK_DAYS)
-                    posts_by_user[username] = posts
-                    consecutive_401_errors = 0
-                    print(
-                        f"Using stale cached @{username} data due to Instagram 401.",
-                        file=sys.stderr,
-                    )
+                if reduced_data_mode:
+                    profile_json = fresh_cache_by_username.get(username)
+                    if profile_json is not None:
+                        posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
+                        posts_by_user[username] = posts
+                        print(
+                            f"Using cached @{username} profile data: {len(posts)} recent post(s)",
+                            file=sys.stderr,
+                        )
+                    else:
+                        print(
+                            f"No fresh cached data available for @{username}; skipping in reduced-data mode.",
+                            file=sys.stderr,
+                        )
                     continue
 
-                if consecutive_401_errors >= 3:
-                    raise RuntimeError(
-                        "Multiple authentication errors detected while contacting Instagram. "
-                        "Instagram may be rate limiting requests from your IP address. "
-                        "Please wait a few minutes before running the script again."
+                profile_json = fresh_cache_by_username.get(username)
+                if profile_json is not None:
+                    posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
+                    posts_by_user[username] = posts
+                    print(
+                        f"Using cached @{username} profile data: {len(posts)} recent post(s)",
+                        file=sys.stderr,
                     )
+                    consecutive_401_errors = 0
+                    continue
 
-            else:
-                print(f"HTTP error for {profile_url}: {e}", file=sys.stderr)
+                profile_json = fetch_profile_json(username, session=instagram_session)
+                _write_profile_cache(username, profile_json)
+                posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
+                posts_by_user[username] = posts
 
-        except Exception as e:
-            print(f"Error for {profile_url}: {e}", file=sys.stderr)
+                print(f"Fetched @{username}: {len(posts)} recent post(s)", file=sys.stderr)
+
+                # reset counter on success
+                consecutive_401_errors = 0
+                time.sleep(random.uniform(0.5, 1.25)) # wait a bit to not hammer w requests
+
+            except requests.HTTPError as e:
+                if e.response.status_code == 401:
+                    consecutive_401_errors += 1
+                    print(f"401 error while fetching {profile_url}", file=sys.stderr)
+
+                    stale_profile_json = _read_profile_cache(
+                        username, max_age_seconds=INSTAGRAM_CACHE_MAX_AGE_SECONDS
+                    )
+                    if stale_profile_json is not None:
+                        posts = extract_recent_posts(stale_profile_json, username, LOOKBACK_DAYS)
+                        posts_by_user[username] = posts
+                        consecutive_401_errors = 0
+                        print(
+                            f"Using stale cached @{username} data due to Instagram 401: "
+                            f"{len(posts)} recent post(s)",
+                            file=sys.stderr,
+                        )
+                        continue
+
+                    if consecutive_401_errors >= 3:
+                        if len(fresh_cache_by_username) > 10:
+                            print(
+                                "Multiple Instagram 401 errors detected. Proceeding with "
+                                "newsletter generation because enough valid cached profiles are available.",
+                                file=sys.stderr,
+                            )
+                            print(
+                                f"Continuing with reduced data: using cached data for "
+                                f"{len(fresh_cache_by_username)} profile(s); live fetches were interrupted by 401 errors.",
+                                file=sys.stderr,
+                            )
+                            reduced_data_mode = True
+                            continue
+                        raise RuntimeError(
+                            "Multiple authentication errors detected while contacting Instagram. "
+                            "Instagram may be rate limiting requests from your IP address. "
+                            "Please wait a few minutes before running the script again."
+                        )
+
+                else:
+                    print(f"HTTP error for {profile_url}: {e}", file=sys.stderr)
+
+            except Exception as e:
+                print(f"Error for {profile_url}: {e}", file=sys.stderr)
 
 
     accounts_with_posts = sum(1 for posts in posts_by_user.values() if posts)
@@ -349,12 +490,12 @@ def generate_newsletter() -> tuple[str, float, int, int]:
 
     end_time = time.time()
     elapsed = end_time - start_time
-    return summary, elapsed, accounts_checked, accounts_with_posts
+    return summary, elapsed, accounts_checked, accounts_with_posts, OLLAMA_MODEL
 
 
 def main() -> int:
     try:
-        summary, elapsed, accounts_checked, accounts_with_posts = generate_newsletter()
+        summary, elapsed, accounts_checked, accounts_with_posts, model_used = generate_newsletter()
     except Exception as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -363,6 +504,7 @@ def main() -> int:
 
     print("\n---")
     print(f" Generated in {elapsed:.2f} seconds")
+    print(f" Model used: {model_used}")
     print(f" Accounts checked: {accounts_checked}")
     print(f" Accounts with recent posts: {accounts_with_posts}")
 
