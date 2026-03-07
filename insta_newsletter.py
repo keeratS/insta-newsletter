@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import secrets
 import sys
 import threading
 import time
@@ -20,12 +21,26 @@ import requests
 INSTAGRAM_APP_ID = "936619743392459"
 OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_MODEL = "qwen3:8b"
+OLLAMA_TIMEOUT_SECONDS = 600
 LOOKBACK_DAYS = 3
 PROFILES_FILE = "profiles.txt"
 INSTAGRAM_CACHE_DIR = Path(".cache/instagram_profiles")
 INSTAGRAM_CACHE_TTL_SECONDS = 3 * 60 * 60
 INSTAGRAM_CACHE_MAX_AGE_SECONDS = 3 * 60 * 60
 INSTAGRAM_DEPRIORITIZE_CACHE_AGE_SECONDS = 24 * 60 * 60
+MIN_CACHED_PROFILES_FOR_REDUCED_MODE = 11
+POEM_MAX_LINES = 7
+MAX_PROMPT_POSTS_PER_ACCOUNT = 2
+MAX_PROMPT_POSTS_TOTAL = 40
+MAX_PROMPT_CAPTION_CHARS = 280
+POEM_STYLES = [
+    "Rumi",
+    "Mary Oliver",
+    "Shakespeare",
+    "Robert Frost",
+    "Ada Limon",
+    "Emily Dickinson",
+]
 INSTAGRAM_REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -264,20 +279,38 @@ def extract_recent_posts(profile_json: dict[str, Any], username: str, lookback_d
     return posts
 
 
-def build_prompt(posts_by_user: dict[str, list[Post]], lookback_days: int) -> str:
+def build_prompt(
+    posts_by_user: dict[str, list[Post]], lookback_days: int
+) -> str:
     sections: list[str] = []
-    total_posts = 0
+    selected_posts_by_user: dict[str, list[Post]] = {}
+    all_selected_posts: list[Post] = []
 
     for username, posts in posts_by_user.items():
         if not posts:
             continue
+        chosen = posts[-MAX_PROMPT_POSTS_PER_ACCOUNT:]
+        selected_posts_by_user[username] = chosen
+        all_selected_posts.extend(chosen)
 
-        total_posts += len(posts)
+    all_selected_posts.sort(key=lambda p: p.taken_at_timestamp or 0, reverse=True)
+    limited_posts = all_selected_posts[:MAX_PROMPT_POSTS_TOTAL]
+
+    limited_by_user: dict[str, list[Post]] = {}
+    for post in limited_posts:
+        limited_by_user.setdefault(post.username, []).append(post)
+
+    total_posts = len(limited_posts)
+    for username, posts in limited_by_user.items():
         section_lines = [f"PROFILE: @{username}"]
-        for post in posts:
+        for post in sorted(posts, key=lambda p: p.taken_at_timestamp or 0):
+            raw_caption = post.caption or "[No caption]"
+            caption = raw_caption
+            if len(caption) > MAX_PROMPT_CAPTION_CHARS:
+                caption = caption[:MAX_PROMPT_CAPTION_CHARS].rstrip() + "..."
             section_lines.append(f"DATE: {post.taken_at_iso}")
             section_lines.append(f"POST URL: {post.post_url}")
-            section_lines.append(f"CAPTION: {post.caption or '[No caption]'}")
+            section_lines.append(f"CAPTION: {caption}")
             section_lines.append("---")
         sections.append("\n".join(section_lines))
 
@@ -296,15 +329,20 @@ Use only the information provided below.
 Do not invent products, events, dates, or claims.
 Group related updates together.
 Prefer concrete updates over vague marketing language.
+Prioritize posts about local/community events and specific happenings (for example events, workshops, talks, exhibits, meetups, deadlines, and announcements with locations/times).
+Also prioritize genuinely new offerings (for example new menu items, new products, new services, or newly announced programs).
 Prioritize updates that include specific dates, deadlines, event times, or time windows.
 In each bullet, explicitly name the specific Instagram account(s) the information came from (for example, "@accountname").
 Every bullet must include at least one @account handle.
 If attribution is uncertain, write "@unknown" instead of guessing.
 Do not merge facts across accounts.
+Do not use boilerplate phrases like "Key takeaway".
+Do not add generic restatements that repeat the same point with less detail.
+Do not write generalizations about an account's overall mission or identity unless that wording appears in the provided captions.
 
 Return exactly:
 1. A title line
-2. 3 to 6 bullet points (prefer 3+ if needed to preserve specific details)
+2. 6 to 12 bullet points
 3. A short newsletter paragraph
 
 Bullet format requirement:
@@ -317,7 +355,51 @@ Instagram data:
 """.strip()
 
 
-def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
+def _looks_like_newsletter_output(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    bullet_count = sum(1 for line in lines if line.startswith("- ") or line.startswith("• "))
+    return bullet_count >= 3
+
+
+def _clean_poem_output(raw_text: str) -> str:
+    cleaned_lines: list[str] = []
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if lower.startswith(("here's", "summary", "key themes", "notable highlights", "---", "###")):
+            continue
+        if line.startswith(("-", "*")) and ":" in line:
+            continue
+        cleaned_lines.append(line)
+        if len(cleaned_lines) >= POEM_MAX_LINES:
+            break
+
+    if not cleaned_lines:
+        return "No poem generated from current updates."
+    return "\n".join(cleaned_lines)
+
+
+def build_poem_prompt(newsletter_text: str, poet_style: str) -> str:
+    source_text = newsletter_text.strip() or "No recent updates were found."
+    return f"""
+Write a short poem based only on this newsletter content.
+Prioritize atypical, surprising, or unusual news/content over routine updates from the newsletter.
+Keep it to no more than {POEM_MAX_LINES} lines.
+Use a light style inspired by {poet_style} (without quoting or imitating exact copyrighted text).
+Do not invent facts that are not present in the provided newsletter.
+Output only the poem lines.
+Do not include headings, bullets, labels, analysis, or any explanatory text.
+
+Newsletter content:
+{source_text}
+""".strip()
+
+
+def ask_ollama(
+    prompt: str, model: str = OLLAMA_MODEL, task_label: str = "newsletter"
+) -> str:
     payload = {
         "model": model,
         "messages": [
@@ -330,11 +412,18 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
         "keep_alive": "10m",
     }
 
+    prompt_chars = len(prompt)
+    prompt_tokens_estimate = max(1, prompt_chars // 4)
+    print(
+        f"Prompt size for Ollama: {prompt_chars} chars (~{prompt_tokens_estimate} tokens estimate)",
+        file=sys.stderr,
+    )
+
     stop_progress = threading.Event()
 
     def _progress_printer() -> None:
         print(
-            f"Generating newsletter with Ollama model '{model}'",
+            f"Generating {task_label} with Ollama model '{model}'",
             end="",
             file=sys.stderr,
             flush=True,
@@ -345,7 +434,7 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
     progress_thread = threading.Thread(target=_progress_printer, daemon=True)
     progress_thread.start()
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=300)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
         response.raise_for_status()
         data = response.json()
         return data["message"]["content"]
@@ -355,7 +444,7 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
         print("", file=sys.stderr)
 
 
-def generate_newsletter() -> tuple[str, float, int, int, str]:
+def generate_newsletter() -> tuple[str, float, int, int, str, str]:
     ensure_profiles_file()
     pruned_cache_files = prune_old_profile_cache_files(
         INSTAGRAM_CACHE_MAX_AGE_SECONDS
@@ -457,7 +546,7 @@ def generate_newsletter() -> tuple[str, float, int, int, str]:
                         continue
 
                     if consecutive_401_errors >= 3:
-                        if len(fresh_cache_by_username) > 10:
+                        if len(fresh_cache_by_username) >= MIN_CACHED_PROFILES_FOR_REDUCED_MODE:
                             print(
                                 "Multiple Instagram 401 errors detected. Proceeding with "
                                 "newsletter generation because enough valid cached profiles are available.",
@@ -484,18 +573,39 @@ def generate_newsletter() -> tuple[str, float, int, int, str]:
 
 
     accounts_with_posts = sum(1 for posts in posts_by_user.values() if posts)
-
     prompt = build_prompt(posts_by_user, LOOKBACK_DAYS)
-    summary = ask_ollama(prompt, model=OLLAMA_MODEL)
+    summary = ask_ollama(prompt, model=OLLAMA_MODEL, task_label="newsletter")
+    if not _looks_like_newsletter_output(summary):
+        print(
+            "Newsletter format check failed; retrying with stricter format reminder.",
+            file=sys.stderr,
+        )
+        retry_prompt = (
+            f"{prompt}\n\nIMPORTANT: Return only the newsletter format requested above. "
+            "Do not ask follow-up questions. Do not offer options. "
+            "Do not include sections outside title, bullet list, and short paragraph."
+        )
+        summary = ask_ollama(retry_prompt, model=OLLAMA_MODEL, task_label="newsletter retry")
+    selected_poet_style = secrets.choice(POEM_STYLES)
+    print(
+        f"Poem style selected for this run: {selected_poet_style}",
+        file=sys.stderr,
+    )
+    poem_prompt = build_poem_prompt(summary, selected_poet_style)
+    poem_raw = ask_ollama(poem_prompt, model=OLLAMA_MODEL, task_label="poem")
+    poem = _clean_poem_output(poem_raw)
+    summary = (
+        f"{summary}\n\nPOEM ({selected_poet_style} inspired):\n{poem}"
+    )
 
     end_time = time.time()
     elapsed = end_time - start_time
-    return summary, elapsed, accounts_checked, accounts_with_posts, OLLAMA_MODEL
+    return summary, elapsed, accounts_checked, accounts_with_posts, OLLAMA_MODEL, selected_poet_style
 
 
 def main() -> int:
     try:
-        summary, elapsed, accounts_checked, accounts_with_posts, model_used = generate_newsletter()
+        summary, elapsed, accounts_checked, accounts_with_posts, model_used, poet_style = generate_newsletter()
     except Exception as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -505,6 +615,7 @@ def main() -> int:
     print("\n---")
     print(f" Generated in {elapsed:.2f} seconds")
     print(f" Model used: {model_used}")
+    print(f" Poet inspiration: {poet_style}")
     print(f" Accounts checked: {accounts_checked}")
     print(f" Accounts with recent posts: {accounts_with_posts}")
 
