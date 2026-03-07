@@ -137,17 +137,25 @@ The wrapper will:
 
 ## Caching
 
-Instagram profile responses are cached on disk to reduce repeated API calls and lower the chance of rate-limit/auth errors.
+Instagram profile responses are cached on disk so the script can make fewer live Instagram requests.
+This helps reduce throttling/rate-limit issues.
 
-- cache path: `.cache/instagram_profiles/`
-- fresh cache window: 3 hours
-- stale fallback window on Instagram `401`: 3 hours
-- fetch order rotates to start at the first profile without cache from the last 24 hours
-- old cache files are pruned automatically during runs
-- after repeated `401` responses, the script can continue in reduced-data mode if enough cached profiles are available
+Cache behavior:
 
-To clear cache manually, delete the `.cache/instagram_profiles` folder.
-The folder is recreated automatically on the next run.
+- cache location: `.cache/instagram_profiles/`
+- fresh cache lifetime: 24 hours
+- if a live request returns `401`, the script can use stale cache up to 24 hours old for that profile
+- cache files older than this window are cleaned up automatically during runs
+
+Fetch strategy:
+
+- profiles are rotated so live fetching starts at the first profile that does not have cache from the last 24 hours
+- if repeated `401` errors occur, the script can continue in reduced-data mode using available cache (instead of failing immediately)
+
+Manual reset:
+
+- delete `.cache/instagram_profiles` to clear cache manually
+- the folder is recreated automatically on the next run
 
 ---
 
@@ -169,7 +177,9 @@ Example cron (twice daily cache refresh at 7:00 and 19:00):
 ```
 0 7,19 * * * cd /path/to/project && ./venv/bin/python refresh_instagram_cache.py
 ```
-This is especially useful when your profile list is long and Instagram throttling (`401` responses) interrupts runs partway through the list.
+
+Note: this is especially useful when your profile list is long and Instagram throttling (`401` responses) interrupts runs partway through the list.
+
 ---
 
 ## Notes
