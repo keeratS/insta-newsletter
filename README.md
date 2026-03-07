@@ -189,6 +189,7 @@ Note: this is especially useful when your profile list is long and Instagram thr
 - Instagram endpoints may change over time.
 - currently tested with qwen3:8b, qwen3:14b, gemma3:12b on macbook m4 pro
 - at time of testing, gemma outputs were generally less useful than qwen outputs for this newsletter task
+- the newsletter may incorrectly attribute things from one post to a different account. in testing this happened for 2/40 events. 
 
 ---
 
