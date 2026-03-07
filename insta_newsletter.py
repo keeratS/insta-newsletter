@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -173,6 +174,7 @@ def ask_ollama(prompt: str, model: str = OLLAMA_MODEL) -> str:
 
 
 def main() -> int:
+    start_time=time.time()
     try:
         profile_urls = read_profiles(PROFILES_FILE)
     except FileNotFoundError:
@@ -183,24 +185,64 @@ def main() -> int:
         print(f"{PROFILES_FILE} is empty.", file=sys.stderr)
         return 1
 
+    accounts_checked = len(profile_urls) 
+    
     posts_by_user: dict[str, list[Post]] = {}
 
+    consecutive_401_errors = 0
+   
     for profile_url in profile_urls:
         try:
             username = extract_username(profile_url)
             profile_json = fetch_profile_json(username)
             posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
             posts_by_user[username] = posts
+
             print(f"Fetched @{username}: {len(posts)} recent post(s)", file=sys.stderr)
+
+            # reset counter on success
+            consecutive_401_errors = 0
+            time.sleep(random.uniform(0.5, 1.25)) # wait a bit to not hammer w requests
+
         except requests.HTTPError as e:
-            print(f"HTTP error for {profile_url}: {e}", file=sys.stderr)
+            if e.response.status_code == 401:
+                consecutive_401_errors += 1
+                print(f"401 error while fetching {profile_url}", file=sys.stderr)
+
+                if consecutive_401_errors >= 3:
+                    print(
+                        "\nFYI: Multiple authentication errors detected while contacting Instagram.\n"
+                        "Instagram may be rate limiting requests from your IP address.\n"
+                        "Please wait a few minutes before running the script again.\n",
+                        file=sys.stderr,
+                    )
+                    return 1 # do not continue to model
+
+            else:
+                print(f"HTTP error for {profile_url}: {e}", file=sys.stderr)
+
         except Exception as e:
             print(f"Error for {profile_url}: {e}", file=sys.stderr)
+
+
+    accounts_with_posts = sum(1 for posts in posts_by_user.values() if posts)
 
     prompt = build_prompt(posts_by_user, LOOKBACK_DAYS)
     summary = ask_ollama(prompt, model=OLLAMA_MODEL)
 
+    end_time = time.time()
+    elapsed = end_time - start_time
+    runtime = f"{elapsed:.2f}"
+
     print(summary)
+    
+    print(summary)
+
+    print("\n---")
+    print(f" Generated in {elapsed:.2f} seconds")
+    print(f" Accounts checked: {accounts_checked}")
+    print(f" Accounts with recent posts: {accounts_with_posts}")
+
     return 0
 
 
