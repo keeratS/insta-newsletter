@@ -546,15 +546,21 @@ def generate_newsletter() -> tuple[str, float, int, int, str, str]:
                         continue
 
                     if consecutive_401_errors >= 3:
-                        if len(fresh_cache_by_username) >= MIN_CACHED_PROFILES_FOR_REDUCED_MODE:
+                        profiles_collected_so_far = len(posts_by_user)
+                        potential_profiles_available = len(
+                            set(posts_by_user.keys()) | set(fresh_cache_by_username.keys())
+                        )
+                        if potential_profiles_available >= MIN_CACHED_PROFILES_FOR_REDUCED_MODE:
                             print(
                                 "Multiple Instagram 401 errors detected. Proceeding with "
-                                "newsletter generation because enough valid cached profiles are available.",
+                                "newsletter generation because enough profile data has already been collected.",
                                 file=sys.stderr,
                             )
                             print(
-                                f"Continuing with reduced data: using cached data for "
-                                f"{len(fresh_cache_by_username)} profile(s); live fetches were interrupted by 401 errors.",
+                                f"Continuing with reduced data: collected data for "
+                                f"{profiles_collected_so_far} profile(s), with up to "
+                                f"{potential_profiles_available} profile(s) available including fresh cache; "
+                                "live fetches were interrupted by 401 errors.",
                                 file=sys.stderr,
                             )
                             reduced_data_mode = True

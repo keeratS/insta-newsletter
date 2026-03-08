@@ -3,4 +3,5 @@ __pycache__/
 profiles.txt
 .DS_Store
 .cache/
+cron.log
 .cache/
