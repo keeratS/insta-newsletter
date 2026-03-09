@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import json
 import random
 import re
@@ -20,8 +21,10 @@ import requests
 
 INSTAGRAM_APP_ID = "936619743392459"
 OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen3:8b"
+NEWSLETTER_OLLAMA_MODEL = "qwen3:8b"
+POEM_OLLAMA_MODEL = "qwen3:8b"
 OLLAMA_TIMEOUT_SECONDS = 600
+INSTAGRAM_REQUEST_TIMEOUT_SECONDS = 60
 LOOKBACK_DAYS = 3
 PROFILES_FILE = "profiles.txt"
 INSTAGRAM_CACHE_DIR = Path(".cache/instagram_profiles")
@@ -118,13 +121,14 @@ def extract_username(profile_url: str) -> str:
 
 
 def fetch_profile_json(
-    username: str, session: requests.Session | None = None
+    username: str, session: requests.Session | None = None, use_timeouts: bool = True
 ) -> dict[str, Any]:
     url = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    request_timeout = INSTAGRAM_REQUEST_TIMEOUT_SECONDS if use_timeouts else None
     if session is None:
-        response = requests.get(url, headers=INSTAGRAM_REQUEST_HEADERS, timeout=60)
+        response = requests.get(url, headers=INSTAGRAM_REQUEST_HEADERS, timeout=request_timeout)
     else:
-        response = session.get(url, timeout=60)
+        response = session.get(url, timeout=request_timeout)
     response.raise_for_status()
     return response.json()
 
@@ -355,12 +359,6 @@ Instagram data:
 """.strip()
 
 
-def _looks_like_newsletter_output(text: str) -> bool:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    bullet_count = sum(1 for line in lines if line.startswith("- ") or line.startswith("• "))
-    return bullet_count >= 3
-
-
 def _clean_poem_output(raw_text: str) -> str:
     cleaned_lines: list[str] = []
     for line in raw_text.splitlines():
@@ -398,7 +396,10 @@ Newsletter content:
 
 
 def ask_ollama(
-    prompt: str, model: str = OLLAMA_MODEL, task_label: str = "newsletter"
+    prompt: str,
+    model: str = NEWSLETTER_OLLAMA_MODEL,
+    task_label: str = "newsletter",
+    use_timeouts: bool = True,
 ) -> str:
     payload = {
         "model": model,
@@ -419,6 +420,7 @@ def ask_ollama(
         file=sys.stderr,
     )
 
+    request_timeout = OLLAMA_TIMEOUT_SECONDS if use_timeouts else None
     stop_progress = threading.Event()
 
     def _progress_printer() -> None:
@@ -434,17 +436,24 @@ def ask_ollama(
     progress_thread = threading.Thread(target=_progress_printer, daemon=True)
     progress_thread.start()
     try:
-        response = requests.post(OLLAMA_URL, json=payload, timeout=OLLAMA_TIMEOUT_SECONDS)
+        response = requests.post(OLLAMA_URL, json=payload, timeout=request_timeout)
         response.raise_for_status()
         data = response.json()
         return data["message"]["content"]
+    except requests.Timeout as e:
+        raise RuntimeError(
+            f"Ollama timed out while generating {task_label}. "
+            "Try again with --no-timeouts or reduce prompt size."
+        ) from e
     finally:
         stop_progress.set()
         progress_thread.join(timeout=1.0)
         print("", file=sys.stderr)
 
 
-def generate_newsletter() -> tuple[str, float, int, int, str, str]:
+def generate_newsletter(
+    use_timeouts: bool = True,
+) -> tuple[str, float, int, int, str, str, str]:
     ensure_profiles_file()
     pruned_cache_files = prune_old_profile_cache_files(
         INSTAGRAM_CACHE_MAX_AGE_SECONDS
@@ -515,7 +524,9 @@ def generate_newsletter() -> tuple[str, float, int, int, str, str]:
                     consecutive_401_errors = 0
                     continue
 
-                profile_json = fetch_profile_json(username, session=instagram_session)
+                profile_json = fetch_profile_json(
+                    username, session=instagram_session, use_timeouts=use_timeouts
+                )
                 _write_profile_cache(username, profile_json)
                 posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
                 posts_by_user[username] = posts
@@ -526,6 +537,11 @@ def generate_newsletter() -> tuple[str, float, int, int, str, str]:
                 consecutive_401_errors = 0
                 time.sleep(random.uniform(0.5, 1.25)) # wait a bit to not hammer w requests
 
+            except requests.Timeout:
+                print(
+                    f"Instagram request timed out for {profile_url}. Skipping this profile for now.",
+                    file=sys.stderr,
+                )
             except requests.HTTPError as e:
                 if e.response.status_code == 401:
                     consecutive_401_errors += 1
@@ -580,25 +596,24 @@ def generate_newsletter() -> tuple[str, float, int, int, str, str]:
 
     accounts_with_posts = sum(1 for posts in posts_by_user.values() if posts)
     prompt = build_prompt(posts_by_user, LOOKBACK_DAYS)
-    summary = ask_ollama(prompt, model=OLLAMA_MODEL, task_label="newsletter")
-    if not _looks_like_newsletter_output(summary):
-        print(
-            "Newsletter format check failed; retrying with stricter format reminder.",
-            file=sys.stderr,
-        )
-        retry_prompt = (
-            f"{prompt}\n\nIMPORTANT: Return only the newsletter format requested above. "
-            "Do not ask follow-up questions. Do not offer options. "
-            "Do not include sections outside title, bullet list, and short paragraph."
-        )
-        summary = ask_ollama(retry_prompt, model=OLLAMA_MODEL, task_label="newsletter retry")
+    summary = ask_ollama(
+        prompt,
+        model=NEWSLETTER_OLLAMA_MODEL,
+        task_label="newsletter",
+        use_timeouts=use_timeouts,
+    )
     selected_poet_style = secrets.choice(POEM_STYLES)
     print(
         f"Poem style selected for this run: {selected_poet_style}",
         file=sys.stderr,
     )
     poem_prompt = build_poem_prompt(summary, selected_poet_style)
-    poem_raw = ask_ollama(poem_prompt, model=OLLAMA_MODEL, task_label="poem")
+    poem_raw = ask_ollama(
+        poem_prompt,
+        model=POEM_OLLAMA_MODEL,
+        task_label="poem",
+        use_timeouts=use_timeouts,
+    )
     poem = _clean_poem_output(poem_raw)
     summary = (
         f"{summary}\n\nPOEM ({selected_poet_style} inspired):\n{poem}"
@@ -606,12 +621,39 @@ def generate_newsletter() -> tuple[str, float, int, int, str, str]:
 
     end_time = time.time()
     elapsed = end_time - start_time
-    return summary, elapsed, accounts_checked, accounts_with_posts, OLLAMA_MODEL, selected_poet_style
+    return (
+        summary,
+        elapsed,
+        accounts_checked,
+        accounts_with_posts,
+        NEWSLETTER_OLLAMA_MODEL,
+        POEM_OLLAMA_MODEL,
+        selected_poet_style,
+    )
 
 
-def main() -> int:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Generate an Instagram newsletter.")
+    parser.add_argument(
+        "--no-timeouts",
+        action="store_true",
+        help="Disable network timeouts for Instagram and Ollama requests.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
     try:
-        summary, elapsed, accounts_checked, accounts_with_posts, model_used, poet_style = generate_newsletter()
+        (
+            summary,
+            elapsed,
+            accounts_checked,
+            accounts_with_posts,
+            model_used,
+            poem_model_used,
+            poet_style,
+        ) = generate_newsletter(use_timeouts=not args.no_timeouts)
     except Exception as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -620,7 +662,8 @@ def main() -> int:
 
     print("\n---")
     print(f" Generated in {elapsed:.2f} seconds")
-    print(f" Model used: {model_used}")
+    print(f" Newsletter model used: {model_used}")
+    print(f" Poem model used: {poem_model_used}")
     print(f" Poet inspiration: {poet_style}")
     print(f" Accounts checked: {accounts_checked}")
     print(f" Accounts with recent posts: {accounts_with_posts}")

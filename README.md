@@ -110,6 +110,13 @@ This script will:
 - generate a short poem (max 7 lines), with random inspiration style per run
 - print runtime stats (generation time, model used, accounts checked, accounts with recent posts)
 
+Timeout note:
+
+- larger Ollama models can take much longer on some laptops, depending on CPU/GPU/RAM
+- if generation runs into timeout errors on your hardware, rerun with:
+  - `python insta_newsletter.py --no-timeouts`
+  - `python send_readwise_insta_newsletter.py --no-timeouts`
+
 ---
 
 ## Readwise Integration
