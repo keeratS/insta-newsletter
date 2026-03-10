@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 import re
 import secrets
@@ -50,6 +51,16 @@ POEM_STYLES = [
     "Robert Frost",
     "Ada Limon",
     "Emily Dickinson",
+]
+STAR_SPINNER_FRAMES = [
+    "*  ",
+    "** ",
+    "***",
+    " **",
+    "  *",
+    " **",
+    "***",
+    "** ",
 ]
 INSTAGRAM_REQUEST_HEADERS = {
     "User-Agent": (
@@ -511,9 +522,14 @@ def _write_account_extraction_cache(
             "extracted_at": int(time.time()),
             "items": items,
         }
-        _extraction_cache_file_for_username(username).write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
-        )
+        cache_file = _extraction_cache_file_for_username(username)
+        serialized = json.dumps(payload, ensure_ascii=False)
+
+        # Direct per-account write: completed accounts persist; interrupted writes only affect that account.
+        with cache_file.open("w", encoding="utf-8") as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
     except Exception:
         return
 
@@ -748,9 +764,22 @@ def ask_ollama(
                 f"Generating {task_label} ({prompt_chars} char, ~{prompt_tokens_estimate} token est.) "
                 f"with Ollama model '{model}'"
             )
-        print(line, end="", file=sys.stderr, flush=True)
-        while not stop_progress.wait(1.0):
-            print(".", end="", file=sys.stderr, flush=True)
+        if verbose:
+            print(line, end="", file=sys.stderr, flush=True)
+            while not stop_progress.wait(1.0):
+                print(".", end="", file=sys.stderr, flush=True)
+            return
+
+        frame_index = 0
+        print(f"{line} {STAR_SPINNER_FRAMES[frame_index]}", end="", file=sys.stderr, flush=True)
+        while not stop_progress.wait(0.2):
+            frame_index = (frame_index + 1) % len(STAR_SPINNER_FRAMES)
+            print(
+                f"\r{line} {STAR_SPINNER_FRAMES[frame_index]}",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
 
     progress_thread = threading.Thread(target=_progress_printer, daemon=True)
     progress_thread.start()
