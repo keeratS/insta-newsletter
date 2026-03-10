@@ -488,26 +488,26 @@ def _extraction_signature_for_posts(posts: list[Post]) -> str:
 
 def _read_account_extraction_cache(
     username: str, posts: list[Post], model: str
-) -> list[dict[str, str]] | None:
+) -> tuple[list[dict[str, str]] | None, str]:
     cache_file = _extraction_cache_file_for_username(username)
     if not cache_file.exists():
-        return None
+        return None, "no_file"
     try:
         payload = json.loads(cache_file.read_text(encoding="utf-8"))
     except Exception:
-        return None
+        return None, "invalid_json"
 
     if not isinstance(payload, dict):
-        return None
+        return None, "invalid_payload"
     if str(payload.get("model", "")) != model:
-        return None
+        return None, "model_mismatch"
     if str(payload.get("signature", "")) != _extraction_signature_for_posts(posts):
-        return None
+        return None, "signature_mismatch"
 
     items = _normalize_extracted_items(payload.get("items"))
     if not items and payload.get("items") != []:
-        return None
-    return items
+        return None, "invalid_items"
+    return items, "hit"
 
 
 def _write_account_extraction_cache(
@@ -542,23 +542,40 @@ def _extract_account_facts(
 ) -> dict[str, list[dict[str, str]]]:
     facts_by_user: dict[str, list[dict[str, str]]] = {}
     account_usernames = [u for u, posts in posts_by_user.items() if posts]
+    cached_extraction_accounts = 0
+    cache_miss_reasons: dict[str, int] = {
+        "no_file": 0,
+        "invalid_json": 0,
+        "invalid_payload": 0,
+        "model_mismatch": 0,
+        "signature_mismatch": 0,
+        "invalid_items": 0,
+    }
     print(
         f"Phase 1/2: extracting structured updates for {len(account_usernames)} account(s).",
         file=sys.stderr,
     )
     for username in account_usernames:
         posts = posts_by_user[username]
-        cached_items = _read_account_extraction_cache(
+        cached_items, cache_status = _read_account_extraction_cache(
             username, posts, NEWSLETTER_OLLAMA_MODEL
         )
         if cached_items is not None:
             facts_by_user[username] = cached_items
+            cached_extraction_accounts += 1
             if verbose:
                 print(
                     f"Using cached Phase 1 extraction for @{username}: {len(cached_items)} item(s)",
                     file=sys.stderr,
                 )
             continue
+        if cache_status in cache_miss_reasons:
+            cache_miss_reasons[cache_status] += 1
+        if verbose:
+            print(
+                f"Phase 1 cache miss for @{username}: {cache_status}",
+                file=sys.stderr,
+            )
 
         extraction_prompt = _build_account_extraction_prompt(username, posts, lookback_days)
         try:
@@ -574,22 +591,32 @@ def _extract_account_facts(
                 raise ValueError("No parseable JSON object returned")
 
             items = _normalize_extracted_items(parsed.get("items", []))
-            if not items:
-                items = _fallback_extract_items(posts)
-            facts_by_user[username] = items
-            _write_account_extraction_cache(
-                username, posts, NEWSLETTER_OLLAMA_MODEL, items
-            )
+            if items:
+                facts_by_user[username] = items
+                _write_account_extraction_cache(
+                    username, posts, NEWSLETTER_OLLAMA_MODEL, items
+                )
+            else:
+                # Do not cache fallback output.
+                facts_by_user[username] = _fallback_extract_items(posts)
         except Exception as e:
             print(
                 f"Account extraction fallback used for @{username}: {e}",
                 file=sys.stderr,
             )
-            fallback_items = _fallback_extract_items(posts)
-            facts_by_user[username] = fallback_items
-            _write_account_extraction_cache(
-                username, posts, NEWSLETTER_OLLAMA_MODEL, fallback_items
-            )
+            facts_by_user[username] = _fallback_extract_items(posts)
+    print(
+        f"Phase 1 cache used for {cached_extraction_accounts} account(s).",
+        file=sys.stderr,
+    )
+    total_misses = len(account_usernames) - cached_extraction_accounts
+    miss_parts = [f"{k}={v}" for k, v in cache_miss_reasons.items() if v > 0]
+    if miss_parts:
+        print(
+            "Phase 1 cache miss reasons: "
+            f"{total_misses} miss(es) ({', '.join(miss_parts)}).",
+            file=sys.stderr,
+        )
     return facts_by_user
 
 
