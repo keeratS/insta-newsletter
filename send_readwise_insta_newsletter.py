@@ -228,7 +228,10 @@ def send_newsletter_to_readwise(
         ) from e
 
 
-def run_newsletter_to_readwise(no_timeouts: bool = False) -> int:
+def run_newsletter_to_readwise(
+    no_timeouts: bool = False,
+    verbose: bool = False,
+) -> int:
     token = os.getenv("READWISE_ACCESS_TOKEN")
     if not token:
         print(
@@ -247,7 +250,10 @@ def run_newsletter_to_readwise(no_timeouts: bool = False) -> int:
             model_used,
             poem_model_used,
             poet_style,
-        ) = generate_newsletter(use_timeouts=not no_timeouts)
+        ) = generate_newsletter(
+            use_timeouts=not no_timeouts,
+            verbose=verbose,
+        )
     except Exception as e:
         print(f"Newsletter generation failed: {e}")
         if "Multiple authentication errors detected while contacting Instagram" in str(e):
@@ -293,9 +299,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable network timeouts for Instagram, Ollama, and Readwise requests.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print verbose logs, including full Phase 1 extracted JSON.",
+    )
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    raise SystemExit(run_newsletter_to_readwise(no_timeouts=args.no_timeouts))
+    raise SystemExit(
+        run_newsletter_to_readwise(
+            no_timeouts=args.no_timeouts,
+            verbose=args.verbose,
+        )
+    )

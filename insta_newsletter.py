@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import re
@@ -21,20 +22,26 @@ import requests
 
 INSTAGRAM_APP_ID = "936619743392459"
 OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_SHOW_URL = "http://localhost:11434/api/show"
 NEWSLETTER_OLLAMA_MODEL = "qwen3:8b"
 POEM_OLLAMA_MODEL = "qwen3:8b"
+NEWSLETTER_TARGET_WORDS = 600
+TOKENS_PER_WORD_ESTIMATE = 1.3
 OLLAMA_TIMEOUT_SECONDS = 600
+OLLAMA_CONTEXT_WARNING_RATIO = 0.9
+OLLAMA_MODEL_INFO_CACHE_FILE = Path(".cache/ollama_model_info.json")
+OLLAMA_MODEL_INFO_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60  # 30 days
 INSTAGRAM_REQUEST_TIMEOUT_SECONDS = 60
 LOOKBACK_DAYS = 3
 PROFILES_FILE = "profiles.txt"
 INSTAGRAM_CACHE_DIR = Path(".cache/instagram_profiles")
-INSTAGRAM_CACHE_TTL_SECONDS = 24 * 60 * 60
-INSTAGRAM_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
-INSTAGRAM_DEPRIORITIZE_CACHE_AGE_SECONDS = 24 * 60 * 60
+INSTAGRAM_EXTRACTION_CACHE_DIR = Path(".cache/instagram_extractions")
+INSTAGRAM_CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
+INSTAGRAM_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60  # 24 hours
+INSTAGRAM_DEPRIORITIZE_CACHE_AGE_SECONDS = 24 * 60 * 60  # 24 hours
 MIN_CACHED_PROFILES_FOR_REDUCED_MODE = 11
 POEM_MAX_LINES = 7
 MAX_PROMPT_POSTS_PER_ACCOUNT = 2
-MAX_PROMPT_POSTS_TOTAL = 40
 MAX_PROMPT_CAPTION_CHARS = 280
 POEM_STYLES = [
     "Rumi",
@@ -59,6 +66,7 @@ INSTAGRAM_REQUEST_HEADERS = {
     "Sec-Fetch-Site": "same-site",
     "x-ig-app-id": INSTAGRAM_APP_ID,
 }
+_MODEL_CONTEXT_LENGTH_CACHE: dict[str, int | None] = {}
 
 
 @dataclass
@@ -144,6 +152,11 @@ def _cache_file_for_username(username: str) -> Path:
     return INSTAGRAM_CACHE_DIR / f"{safe_username}.json"
 
 
+def _extraction_cache_file_for_username(username: str) -> Path:
+    safe_username = re.sub(r"[^a-zA-Z0-9_.-]", "_", username)
+    return INSTAGRAM_EXTRACTION_CACHE_DIR / f"{safe_username}.json"
+
+
 def _write_profile_cache(username: str, profile_json: dict[str, Any]) -> None:
     INSTAGRAM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_payload = {
@@ -206,7 +219,36 @@ def prune_old_profile_cache_files(max_age_seconds: int) -> int:
     return deleted
 
 
-def rotate_profiles_for_fetch_priority(profile_urls: list[str]) -> list[str]:
+def prune_old_extraction_cache_files(max_age_seconds: int) -> int:
+    if not INSTAGRAM_EXTRACTION_CACHE_DIR.exists():
+        return 0
+
+    deleted = 0
+    now = int(time.time())
+    for cache_file in INSTAGRAM_EXTRACTION_CACHE_DIR.glob("*.json"):
+        should_delete = False
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            extracted_at = int(payload.get("extracted_at", 0))
+            if extracted_at <= 0:
+                extracted_at = int(cache_file.stat().st_mtime)
+            should_delete = (now - extracted_at) > max_age_seconds
+        except Exception:
+            should_delete = True
+
+        if should_delete:
+            try:
+                cache_file.unlink()
+                deleted += 1
+            except OSError:
+                pass
+
+    return deleted
+
+
+def rotate_profiles_for_fetch_priority(
+    profile_urls: list[str], *, verbose: bool = True
+) -> list[str]:
     if not profile_urls:
         return profile_urls
 
@@ -235,7 +277,7 @@ def rotate_profiles_for_fetch_priority(profile_urls: list[str]) -> list[str]:
         return profile_urls
 
     rotated = profile_urls[start_index:] + profile_urls[:start_index]
-    if start_username:
+    if start_username and verbose:
         print(
             f"Fetch priority rotated: starting at @{start_username} (no cache from last 24 hours).",
             file=sys.stderr,
@@ -283,79 +325,317 @@ def extract_recent_posts(profile_json: dict[str, Any], username: str, lookback_d
     return posts
 
 
-def build_prompt(
-    posts_by_user: dict[str, list[Post]], lookback_days: int
-) -> str:
-    sections: list[str] = []
-    selected_posts_by_user: dict[str, list[Post]] = {}
-    all_selected_posts: list[Post] = []
+def _trim_caption(caption: str) -> str:
+    text = caption or "[No caption]"
+    if len(text) > MAX_PROMPT_CAPTION_CHARS:
+        return text[:MAX_PROMPT_CAPTION_CHARS].rstrip() + "..."
+    return text
 
-    for username, posts in posts_by_user.items():
-        if not posts:
-            continue
-        chosen = posts[-MAX_PROMPT_POSTS_PER_ACCOUNT:]
-        selected_posts_by_user[username] = chosen
-        all_selected_posts.extend(chosen)
 
-    all_selected_posts.sort(key=lambda p: p.taken_at_timestamp or 0, reverse=True)
-    limited_posts = all_selected_posts[:MAX_PROMPT_POSTS_TOTAL]
+def _trim_quote(text: str, max_words: int = 20) -> str:
+    words = (text or "").split()
+    if not words:
+        return ""
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words]).rstrip() + "..."
 
-    limited_by_user: dict[str, list[Post]] = {}
-    for post in limited_posts:
-        limited_by_user.setdefault(post.username, []).append(post)
 
-    total_posts = len(limited_posts)
-    for username, posts in limited_by_user.items():
-        section_lines = [f"PROFILE: @{username}"]
-        for post in sorted(posts, key=lambda p: p.taken_at_timestamp or 0):
-            raw_caption = post.caption or "[No caption]"
-            caption = raw_caption
-            if len(caption) > MAX_PROMPT_CAPTION_CHARS:
-                caption = caption[:MAX_PROMPT_CAPTION_CHARS].rstrip() + "..."
-            section_lines.append(f"DATE: {post.taken_at_iso}")
-            section_lines.append(f"POST URL: {post.post_url}")
-            section_lines.append(f"CAPTION: {caption}")
-            section_lines.append("---")
-        sections.append("\n".join(section_lines))
+def _clean_json_text(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+    return cleaned.strip()
 
-    if total_posts == 0:
-        return (
-            f"No posts were found in the last {lookback_days} days. "
-            "Reply with a short note saying there were no recent updates."
-        )
 
-    body = "\n\n".join(sections)
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = _clean_json_text(text)
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
 
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    candidate = cleaned[start : end + 1]
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        return None
+    return None
+
+
+def _build_account_extraction_prompt(username: str, posts: list[Post], lookback_days: int) -> str:
+    lines: list[str] = []
+    for post in posts[-MAX_PROMPT_POSTS_PER_ACCOUNT:]:
+        lines.append(f"DATE: {post.taken_at_iso}")
+        lines.append(f"POST URL: {post.post_url}")
+        lines.append(f"CAPTION: {_trim_caption(post.caption)}")
+        lines.append("---")
+    body = "\n".join(lines)
     return f"""
-You are creating a short newsletter-style summary from recent Instagram captions.
+Extract structured updates from this single Instagram account.
+Only use facts present in the captions below.
+Do not invent events, dates, locations, or offerings.
+Prioritize concrete updates (events, deadlines, announcements, new offerings).
 
-Use only the information provided below.
+Return valid JSON only with this exact schema:
+{{
+  "account": "@{username}",
+  "items": [
+    {{
+      "kind": "event|announcement|new_offering|other",
+      "summary": "concise factual summary",
+      "date_text": "exact date/time text if present, otherwise empty string",
+      "location": "location text if present, otherwise empty string",
+      "source_post_url": "instagram post url",
+      "quote": "short direct caption quote (max 20 words) that captures the account voice, or empty string",
+      "confidence": "high|medium|low"
+    }}
+  ]
+}}
+
+If no useful items are present, return:
+{{"account":"@{username}","items":[]}}
+
+Time window: last {lookback_days} days
+Account data:
+{body}
+""".strip()
+
+
+def _fallback_extract_items(posts: list[Post]) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    for post in posts[-MAX_PROMPT_POSTS_PER_ACCOUNT:]:
+        caption = _trim_caption(post.caption)
+        if caption == "[No caption]":
+            continue
+        quote = caption
+        quote_words = quote.split()
+        if len(quote_words) > 20:
+            quote = " ".join(quote_words[:20]).rstrip() + "..."
+        items.append(
+            {
+                "kind": "other",
+                "summary": caption,
+                "date_text": post.taken_at_iso,
+                "location": "",
+                "source_post_url": post.post_url,
+                "quote": quote,
+                "confidence": "low",
+            }
+        )
+    return items
+
+
+def _normalize_extracted_items(raw_items: Any) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    if not isinstance(raw_items, list):
+        return items
+
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        summary = str(item.get("summary", "")).strip()
+        source_post_url = str(item.get("source_post_url", "")).strip()
+        if not summary or not source_post_url:
+            continue
+        items.append(
+            {
+                "kind": str(item.get("kind", "other")).strip() or "other",
+                "summary": summary,
+                "date_text": str(item.get("date_text", "")).strip(),
+                "location": str(item.get("location", "")).strip(),
+                "source_post_url": source_post_url,
+                "quote": _trim_quote(str(item.get("quote", "")).strip(), 20),
+                "confidence": str(item.get("confidence", "medium")).strip() or "medium",
+            }
+        )
+    return items
+
+
+def _extraction_signature_for_posts(posts: list[Post]) -> str:
+    selected = posts[-MAX_PROMPT_POSTS_PER_ACCOUNT:]
+    signature_payload = [
+        {
+            "shortcode": post.shortcode,
+            "taken_at_timestamp": post.taken_at_timestamp,
+            "caption": _trim_caption(post.caption),
+        }
+        for post in selected
+    ]
+    raw = json.dumps(signature_payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _read_account_extraction_cache(
+    username: str, posts: list[Post], model: str
+) -> list[dict[str, str]] | None:
+    cache_file = _extraction_cache_file_for_username(username)
+    if not cache_file.exists():
+        return None
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("model", "")) != model:
+        return None
+    if str(payload.get("signature", "")) != _extraction_signature_for_posts(posts):
+        return None
+
+    items = _normalize_extracted_items(payload.get("items"))
+    if not items and payload.get("items") != []:
+        return None
+    return items
+
+
+def _write_account_extraction_cache(
+    username: str, posts: list[Post], model: str, items: list[dict[str, str]]
+) -> None:
+    try:
+        INSTAGRAM_EXTRACTION_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "username": username,
+            "model": model,
+            "signature": _extraction_signature_for_posts(posts),
+            "extracted_at": int(time.time()),
+            "items": items,
+        }
+        _extraction_cache_file_for_username(username).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        return
+
+
+def _extract_account_facts(
+    posts_by_user: dict[str, list[Post]],
+    lookback_days: int,
+    use_timeouts: bool,
+    verbose: bool,
+) -> dict[str, list[dict[str, str]]]:
+    facts_by_user: dict[str, list[dict[str, str]]] = {}
+    account_usernames = [u for u, posts in posts_by_user.items() if posts]
+    print(
+        f"Phase 1/2: extracting structured updates for {len(account_usernames)} account(s).",
+        file=sys.stderr,
+    )
+    for username in account_usernames:
+        posts = posts_by_user[username]
+        cached_items = _read_account_extraction_cache(
+            username, posts, NEWSLETTER_OLLAMA_MODEL
+        )
+        if cached_items is not None:
+            facts_by_user[username] = cached_items
+            if verbose:
+                print(
+                    f"Using cached Phase 1 extraction for @{username}: {len(cached_items)} item(s)",
+                    file=sys.stderr,
+                )
+            continue
+
+        extraction_prompt = _build_account_extraction_prompt(username, posts, lookback_days)
+        try:
+            raw = ask_ollama(
+                extraction_prompt,
+                model=NEWSLETTER_OLLAMA_MODEL,
+                task_label=f"account extraction @{username}",
+                use_timeouts=use_timeouts,
+                verbose=verbose,
+            )
+            parsed = _extract_json_object(raw)
+            if not parsed:
+                raise ValueError("No parseable JSON object returned")
+
+            items = _normalize_extracted_items(parsed.get("items", []))
+            if not items:
+                items = _fallback_extract_items(posts)
+            facts_by_user[username] = items
+            _write_account_extraction_cache(
+                username, posts, NEWSLETTER_OLLAMA_MODEL, items
+            )
+        except Exception as e:
+            print(
+                f"Account extraction fallback used for @{username}: {e}",
+                file=sys.stderr,
+            )
+            fallback_items = _fallback_extract_items(posts)
+            facts_by_user[username] = fallback_items
+            _write_account_extraction_cache(
+                username, posts, NEWSLETTER_OLLAMA_MODEL, fallback_items
+            )
+    return facts_by_user
+
+
+def build_newsletter_prompt_from_facts(
+    facts_by_user: dict[str, list[dict[str, str]]]
+) -> str:
+    lines: list[str] = []
+    total_items = 0
+    for username, items in facts_by_user.items():
+        if not items:
+            continue
+        lines.append(f"ACCOUNT: @{username}")
+        for item in items:
+            total_items += 1
+            lines.append(f"KIND: {item['kind']}")
+            lines.append(f"SUMMARY: {item['summary']}")
+            lines.append(f"DATE_TEXT: {item['date_text']}")
+            lines.append(f"LOCATION: {item['location']}")
+            lines.append(f"SOURCE_POST_URL: {item['source_post_url']}")
+            lines.append(f"QUOTE: {item.get('quote', '')}")
+            lines.append(f"CONFIDENCE: {item['confidence']}")
+            lines.append("---")
+
+    if total_items == 0:
+        return "No extracted updates were found. Reply with a short note saying there were no recent updates."
+
+    accounts_with_nonzero_posts = sum(1 for items in facts_by_user.values() if items)
+    min_additional_sections = accounts_with_nonzero_posts // 4
+    today_local = datetime.now().astimezone().date().isoformat()
+
+    facts_block = "\n".join(lines)
+    return f"""
+You are creating a short newsletter-style summary from extracted Instagram updates.
+Use only the extracted facts below.
 Do not invent products, events, dates, or claims.
-Group related updates together.
-Prefer concrete updates over vague marketing language.
-Prioritize posts about local/community events and specific happenings (for example events, workshops, talks, exhibits, meetups, deadlines, and announcements with locations/times).
-Also prioritize genuinely new offerings (for example new menu items, new products, new services, or newly announced programs).
-Prioritize updates that include specific dates, deadlines, event times, or time windows.
-In each bullet, explicitly name the specific Instagram account(s) the information came from (for example, "@accountname").
-Every bullet must include at least one @account handle.
-If attribution is uncertain, write "@unknown" instead of guessing.
-Do not merge facts across accounts.
+Prefer concrete updates over vague statements.
+Prioritize local/community events and new offerings.
+Prioritize updates with dates, deadlines, event times, or time windows.
 Do not use boilerplate phrases like "Key takeaway".
-Do not add generic restatements that repeat the same point with less detail.
-Do not write generalizations about an account's overall mission or identity unless that wording appears in the provided captions.
+Do not add generic restatements.
+Use quote snippets only if they add voice.
+Any quote must come from QUOTE lines in the extracted updates.
+Today's date (local): {today_local}
+Minimum additional section count: {min_additional_sections} (computed as floor({accounts_with_nonzero_posts} / 4))
 
 Return exactly:
 1. A title line
-2. 6 to 12 bullet points
-3. A short newsletter paragraph
+2. Section heading: Upcoming
+3. 2 to 6 bullets under Upcoming, containing only updates with date/time that are today ({today_local}) or in the future
+4. At least {min_additional_sections} additional themed sections after Upcoming, each with a heading and 2 to 5 bullets
+5. A short closing paragraph (3-5 sentences) that ties together the main trends
 
 Bullet format requirement:
-- [@account] concise factual update
+- concise factual update that names at least one specific account in parentheses, e.g. (@account)
+- include date text when available
 
-Time window: last {lookback_days} days
+Length target:
+- around {NEWSLETTER_TARGET_WORDS} words total
+- at least 8 bullets overall across all sections
 
-Instagram data:
-{body}
+Extracted updates:
+{facts_block}
 """.strip()
 
 
@@ -400,6 +680,8 @@ def ask_ollama(
     model: str = NEWSLETTER_OLLAMA_MODEL,
     task_label: str = "newsletter",
     use_timeouts: bool = True,
+    estimated_output_tokens: int | None = None,
+    verbose: bool = False,
 ) -> str:
     payload = {
         "model": model,
@@ -415,21 +697,58 @@ def ask_ollama(
 
     prompt_chars = len(prompt)
     prompt_tokens_estimate = max(1, prompt_chars // 4)
-    print(
-        f"Prompt size for Ollama: {prompt_chars} chars (~{prompt_tokens_estimate} tokens estimate)",
-        file=sys.stderr,
+    output_tokens_estimate = (
+        estimated_output_tokens
+        if estimated_output_tokens is not None and estimated_output_tokens > 0
+        else prompt_tokens_estimate
     )
+    estimated_total_tokens = prompt_tokens_estimate + output_tokens_estimate
+    model_context_length, used_cached_context = _get_model_context_length(
+        model, use_timeouts=use_timeouts
+    )
+    if model_context_length:
+        warning_context_length = model_context_length
+        context_usage_ratio = estimated_total_tokens / warning_context_length
+        warning_needed = (
+            context_usage_ratio >= OLLAMA_CONTEXT_WARNING_RATIO
+            or estimated_total_tokens > warning_context_length
+        )
 
+        # If warning is based on cached model info, re-check live model info first.
+        if warning_needed and used_cached_context:
+            live_context_length, _ = _get_model_context_length(
+                model, use_timeouts=use_timeouts, force_refresh=True
+            )
+            if live_context_length:
+                warning_context_length = live_context_length
+                context_usage_ratio = estimated_total_tokens / warning_context_length
+
+        if context_usage_ratio >= OLLAMA_CONTEXT_WARNING_RATIO:
+            print(
+                "Warning: estimated Ollama context usage is high for this request "
+                f"({estimated_total_tokens}/{warning_context_length} tokens; "
+                f"prompt~{prompt_tokens_estimate}, output~{output_tokens_estimate}). "
+                "The model may truncate earlier instructions or source data.",
+                file=sys.stderr,
+            )
+        if estimated_total_tokens > warning_context_length:
+            print(
+                "Warning: estimated prompt + output reserve exceeds model context length "
+                f"({estimated_total_tokens}>{warning_context_length}). Truncation is likely.",
+                file=sys.stderr,
+            )
     request_timeout = OLLAMA_TIMEOUT_SECONDS if use_timeouts else None
     stop_progress = threading.Event()
 
     def _progress_printer() -> None:
-        print(
-            f"Generating {task_label} with Ollama model '{model}'",
-            end="",
-            file=sys.stderr,
-            flush=True,
-        )
+        if not verbose and task_label.startswith("account extraction @"):
+            line = f"[{model}] Generating {task_label}"
+        else:
+            line = (
+                f"Generating {task_label} ({prompt_chars} char, ~{prompt_tokens_estimate} token est.) "
+                f"with Ollama model '{model}'"
+            )
+        print(line, end="", file=sys.stderr, flush=True)
         while not stop_progress.wait(1.0):
             print(".", end="", file=sys.stderr, flush=True)
 
@@ -451,15 +770,149 @@ def ask_ollama(
         print("", file=sys.stderr)
 
 
+def _maybe_parse_int(value: Any) -> int | None:
+    try:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if isinstance(value, float):
+            v = int(value)
+            return v if v > 0 else None
+        if isinstance(value, str):
+            m = re.search(r"([0-9][0-9,]*)", value)
+            if not m:
+                return None
+            v = int(m.group(1).replace(",", ""))
+            return v if v > 0 else None
+    except Exception:
+        return None
+    return None
+
+
+def _extract_context_length_from_show_payload(payload: dict[str, Any]) -> int | None:
+    # Prefer explicit model_info keys like "qwen3.context_length" or "llama.context_length".
+    model_info = payload.get("model_info")
+    if isinstance(model_info, dict):
+        for key, value in model_info.items():
+            if "context_length" in str(key).lower():
+                parsed = _maybe_parse_int(value)
+                if parsed is not None:
+                    return parsed
+
+    # Fallback: scan top-level keys that contain context length fields.
+    for key in ("context_length", "num_ctx"):
+        if key in payload:
+            parsed = _maybe_parse_int(payload.get(key))
+            if parsed is not None:
+                return parsed
+
+    # Last resort: scan string fields (e.g., parameters blobs) for context length hints.
+    for key in ("parameters", "modelfile", "template"):
+        value = payload.get(key)
+        if isinstance(value, str) and "context" in value.lower():
+            parsed = _maybe_parse_int(value)
+            if parsed is not None:
+                return parsed
+
+    return None
+
+
+def _read_ollama_model_info_cache() -> dict[str, dict[str, int]]:
+    if not OLLAMA_MODEL_INFO_CACHE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(OLLAMA_MODEL_INFO_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, dict[str, int]] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            continue
+        context_length = _maybe_parse_int(value.get("context_length"))
+        fetched_at = _maybe_parse_int(value.get("fetched_at"))
+        if context_length is None or fetched_at is None:
+            continue
+        normalized[key] = {"context_length": context_length, "fetched_at": fetched_at}
+    return normalized
+
+
+def _write_ollama_model_info_cache(cache_payload: dict[str, dict[str, int]]) -> None:
+    try:
+        OLLAMA_MODEL_INFO_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        OLLAMA_MODEL_INFO_CACHE_FILE.write_text(
+            json.dumps(cache_payload, indent=2), encoding="utf-8"
+        )
+    except Exception:
+        return
+
+
+def _fetch_live_model_context_length(
+    model: str, use_timeouts: bool = True
+) -> int | None:
+    request_timeout = INSTAGRAM_REQUEST_TIMEOUT_SECONDS if use_timeouts else None
+
+    try:
+        response = requests.post(
+            OLLAMA_SHOW_URL,
+            json={"model": model},
+            timeout=request_timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        context_length = _extract_context_length_from_show_payload(payload)
+        return context_length
+    except Exception:
+        return None
+
+
+def _get_model_context_length(
+    model: str, use_timeouts: bool = True, force_refresh: bool = False
+) -> tuple[int | None, bool]:
+    if not force_refresh and model in _MODEL_CONTEXT_LENGTH_CACHE:
+        return _MODEL_CONTEXT_LENGTH_CACHE[model], True
+
+    now = int(time.time())
+    if not force_refresh:
+        disk_cache = _read_ollama_model_info_cache()
+        cached = disk_cache.get(model)
+        if cached:
+            fetched_at = cached["fetched_at"]
+            if (now - fetched_at) <= OLLAMA_MODEL_INFO_CACHE_TTL_SECONDS:
+                context_length = cached["context_length"]
+                _MODEL_CONTEXT_LENGTH_CACHE[model] = context_length
+                return context_length, True
+
+    context_length = _fetch_live_model_context_length(model, use_timeouts=use_timeouts)
+    _MODEL_CONTEXT_LENGTH_CACHE[model] = context_length
+
+    if context_length is not None:
+        disk_cache = _read_ollama_model_info_cache()
+        disk_cache[model] = {"context_length": context_length, "fetched_at": now}
+        _write_ollama_model_info_cache(disk_cache)
+    return context_length, False
+
+
 def generate_newsletter(
     use_timeouts: bool = True,
+    verbose: bool = False,
 ) -> tuple[str, float, int, int, str, str, str]:
     ensure_profiles_file()
     pruned_cache_files = prune_old_profile_cache_files(
         INSTAGRAM_CACHE_MAX_AGE_SECONDS
     )
+    pruned_extraction_cache_files = prune_old_extraction_cache_files(
+        INSTAGRAM_CACHE_MAX_AGE_SECONDS
+    )
     if pruned_cache_files:
         print(f"Pruned {pruned_cache_files} old Instagram cache file(s).", file=sys.stderr)
+    if pruned_extraction_cache_files:
+        print(
+            f"Pruned {pruned_extraction_cache_files} old extraction cache file(s).",
+            file=sys.stderr,
+        )
 
     start_time = time.time()
     try:
@@ -472,10 +925,14 @@ def generate_newsletter(
     if not profile_urls:
         raise ValueError(f"{PROFILES_FILE} is empty.")
 
-    prioritized_profile_urls = rotate_profiles_for_fetch_priority(profile_urls)
+    prioritized_profile_urls = rotate_profiles_for_fetch_priority(
+        profile_urls, verbose=verbose
+    )
     accounts_checked = len(profile_urls) 
     
     posts_by_user: dict[str, list[Post]] = {}
+    live_data_accounts: set[str] = set()
+    cached_data_accounts: set[str] = set()
 
     consecutive_401_errors = 0
     reduced_data_mode = False
@@ -491,6 +948,32 @@ def generate_newsletter(
         if cached_profile_json is not None:
             fresh_cache_by_username[cached_username] = cached_profile_json
    
+    live_fetch_progress_started = False
+    live_fetch_progress_line_open = False
+
+    def _start_or_tick_live_fetch_progress() -> None:
+        nonlocal live_fetch_progress_started, live_fetch_progress_line_open
+        if verbose:
+            return
+        if not live_fetch_progress_line_open:
+            print(
+                "Fetching live Instagram data",
+                end="",
+                file=sys.stderr,
+                flush=True,
+            )
+            live_fetch_progress_started = True
+            live_fetch_progress_line_open = True
+        print(".", end="", file=sys.stderr, flush=True)
+
+    def _flush_live_fetch_progress_line() -> None:
+        nonlocal live_fetch_progress_line_open
+        if verbose:
+            return
+        if live_fetch_progress_line_open:
+            print("", file=sys.stderr)
+            live_fetch_progress_line_open = False
+
     with make_instagram_session() as instagram_session:
         for profile_url in prioritized_profile_urls:
             username: str | None = None
@@ -502,47 +985,57 @@ def generate_newsletter(
                     if profile_json is not None:
                         posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
                         posts_by_user[username] = posts
-                        print(
-                            f"Using cached @{username} profile data: {len(posts)} recent post(s)",
-                            file=sys.stderr,
-                        )
+                        cached_data_accounts.add(username)
+                        if verbose:
+                            print(
+                                f"Using cached @{username} profile data: {len(posts)} recent post(s)",
+                                file=sys.stderr,
+                            )
                     else:
-                        print(
-                            f"No fresh cached data available for @{username}; skipping in reduced-data mode.",
-                            file=sys.stderr,
-                        )
+                        if verbose:
+                            print(
+                                f"No fresh cached data available for @{username}; skipping in reduced-data mode.",
+                                file=sys.stderr,
+                            )
                     continue
 
                 profile_json = fresh_cache_by_username.get(username)
                 if profile_json is not None:
                     posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
                     posts_by_user[username] = posts
-                    print(
-                        f"Using cached @{username} profile data: {len(posts)} recent post(s)",
-                        file=sys.stderr,
-                    )
+                    cached_data_accounts.add(username)
+                    if verbose:
+                        print(
+                            f"Using cached @{username} profile data: {len(posts)} recent post(s)",
+                            file=sys.stderr,
+                        )
                     consecutive_401_errors = 0
                     continue
 
+                _start_or_tick_live_fetch_progress()
                 profile_json = fetch_profile_json(
                     username, session=instagram_session, use_timeouts=use_timeouts
                 )
                 _write_profile_cache(username, profile_json)
                 posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
                 posts_by_user[username] = posts
+                live_data_accounts.add(username)
 
-                print(f"Fetched @{username}: {len(posts)} recent post(s)", file=sys.stderr)
+                if verbose:
+                    print(f"Fetched @{username}: {len(posts)} recent post(s)", file=sys.stderr)
 
                 # reset counter on success
                 consecutive_401_errors = 0
                 time.sleep(random.uniform(0.5, 1.25)) # wait a bit to not hammer w requests
 
             except requests.Timeout:
+                _flush_live_fetch_progress_line()
                 print(
                     f"Instagram request timed out for {profile_url}. Skipping this profile for now.",
                     file=sys.stderr,
                 )
             except requests.HTTPError as e:
+                _flush_live_fetch_progress_line()
                 if e.response.status_code == 401:
                     consecutive_401_errors += 1
                     print(f"401 error while fetching {profile_url}", file=sys.stderr)
@@ -553,12 +1046,14 @@ def generate_newsletter(
                     if stale_profile_json is not None:
                         posts = extract_recent_posts(stale_profile_json, username, LOOKBACK_DAYS)
                         posts_by_user[username] = posts
+                        cached_data_accounts.add(username)
                         consecutive_401_errors = 0
-                        print(
-                            f"Using stale cached @{username} data due to Instagram 401: "
-                            f"{len(posts)} recent post(s)",
-                            file=sys.stderr,
-                        )
+                        if verbose:
+                            print(
+                                f"Using stale cached @{username} data due to Instagram 401: "
+                                f"{len(posts)} recent post(s)",
+                                file=sys.stderr,
+                            )
                         continue
 
                     if consecutive_401_errors >= 3:
@@ -591,28 +1086,62 @@ def generate_newsletter(
                     print(f"HTTP error for {profile_url}: {e}", file=sys.stderr)
 
             except Exception as e:
+                _flush_live_fetch_progress_line()
                 print(f"Error for {profile_url}: {e}", file=sys.stderr)
+
+    if live_fetch_progress_started and not verbose:
+        _flush_live_fetch_progress_line()
 
 
     accounts_with_posts = sum(1 for posts in posts_by_user.values() if posts)
-    prompt = build_prompt(posts_by_user, LOOKBACK_DAYS)
+    if not verbose:
+        print(
+            "\nCollected Instagram data for "
+            f"{len(posts_by_user)} account(s): "
+            f"{accounts_with_posts} with recent posts, "
+            f"{len(live_data_accounts)} fresh, "
+            f"{len(cached_data_accounts)} cached.",
+            file=sys.stderr,
+        )
+    facts_by_user = _extract_account_facts(
+        posts_by_user,
+        LOOKBACK_DAYS,
+        use_timeouts=use_timeouts,
+        verbose=verbose,
+    )
+    total_extracted_items = sum(len(items) for items in facts_by_user.values())
+    if verbose:
+        print("\nPhase 1 extracted facts (JSON):", file=sys.stderr)
+        print(json.dumps(facts_by_user, indent=2, ensure_ascii=False), file=sys.stderr)
+    else:
+        print(
+            f"\nPhase 1 extraction complete: {len(facts_by_user)} account(s), "
+            f"{total_extracted_items} extracted item(s).",
+            file=sys.stderr,
+        )
+    print("\nPhase 2/2: generating newsletter from extracted account facts.", file=sys.stderr)
+    prompt = build_newsletter_prompt_from_facts(facts_by_user)
     summary = ask_ollama(
         prompt,
         model=NEWSLETTER_OLLAMA_MODEL,
         task_label="newsletter",
         use_timeouts=use_timeouts,
+        estimated_output_tokens=max(1, round(NEWSLETTER_TARGET_WORDS * TOKENS_PER_WORD_ESTIMATE)),
+        verbose=verbose,
     )
     selected_poet_style = secrets.choice(POEM_STYLES)
-    print(
-        f"Poem style selected for this run: {selected_poet_style}",
-        file=sys.stderr,
-    )
+    if verbose:
+        print(
+            f"Poem style selected for this run: {selected_poet_style}",
+            file=sys.stderr,
+        )
     poem_prompt = build_poem_prompt(summary, selected_poet_style)
     poem_raw = ask_ollama(
         poem_prompt,
         model=POEM_OLLAMA_MODEL,
         task_label="poem",
         use_timeouts=use_timeouts,
+        verbose=verbose,
     )
     poem = _clean_poem_output(poem_raw)
     summary = (
@@ -639,6 +1168,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable network timeouts for Instagram and Ollama requests.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print verbose logs, including full Phase 1 extracted JSON.",
+    )
     return parser.parse_args(argv)
 
 
@@ -653,7 +1187,10 @@ def main(argv: list[str] | None = None) -> int:
             model_used,
             poem_model_used,
             poet_style,
-        ) = generate_newsletter(use_timeouts=not args.no_timeouts)
+        ) = generate_newsletter(
+            use_timeouts=not args.no_timeouts,
+            verbose=args.verbose,
+        )
     except Exception as e:
         print(str(e), file=sys.stderr)
         return 1

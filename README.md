@@ -150,9 +150,11 @@ This helps reduce throttling/rate-limit issues.
 Cache behavior:
 
 - cache location: `.cache/instagram_profiles/`
+- phase-1 extraction cache location: `.cache/instagram_extractions/`
 - fresh cache lifetime: 24 hours
 - if a live request returns `401`, the script can use stale cache up to 24 hours old for that profile
 - cache files older than this window are cleaned up automatically during runs
+- phase-1 extraction cache entries are keyed by account, selected posts, and extraction model
 
 Fetch strategy:
 
@@ -162,6 +164,8 @@ Fetch strategy:
 Manual reset:
 
 - delete `.cache/instagram_profiles` to clear cache manually
+- delete `.cache/instagram_extractions` to clear phase-1 extraction cache manually
+- if you change extraction prompt or extraction JSON format, clear both cache folders before running again
 - the folder is recreated automatically on the next run
 
 ---
