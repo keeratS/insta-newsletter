@@ -51,8 +51,13 @@ Curiosity, a compass, guides the way.
 
 ---
  Generated in 497.30 seconds
+ 
  Newsletter model used: qwen3:8b
+ 
  Poem model used: qwen3:8b
+ 
  Poet inspiration: Mary Oliver
+ 
  Accounts checked: 50
+ 
  Accounts with recent posts: 26
