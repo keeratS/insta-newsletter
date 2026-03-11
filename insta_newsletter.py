@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -12,7 +13,7 @@ import sys
 import threading
 import time
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -26,6 +27,8 @@ OLLAMA_URL = "http://localhost:11434/api/chat"
 OLLAMA_SHOW_URL = "http://localhost:11434/api/show"
 NEWSLETTER_OLLAMA_MODEL = "qwen3:8b"
 POEM_OLLAMA_MODEL = "qwen3:8b"
+IMAGE_TEXT_OLLAMA_MODEL = "qwen2.5vl:7b"
+IMAGE_TEXT_SUMMARY_OLLAMA_MODEL = "qwen3:8b"
 NEWSLETTER_TARGET_WORDS = 600
 TOKENS_PER_WORD_ESTIMATE = 1.3
 OLLAMA_TIMEOUT_SECONDS = 600
@@ -37,13 +40,17 @@ LOOKBACK_DAYS = 3
 PROFILES_FILE = "profiles.txt"
 INSTAGRAM_CACHE_DIR = Path(".cache/instagram_profiles")
 INSTAGRAM_EXTRACTION_CACHE_DIR = Path(".cache/instagram_extractions")
+INSTAGRAM_IMAGE_TEXT_CACHE_DIR = Path(".cache/instagram_image_text")
+INSTAGRAM_CAROUSEL_SUMMARY_CACHE_DIR = Path(".cache/instagram_carousel_summaries")
 INSTAGRAM_CACHE_TTL_SECONDS = 24 * 60 * 60  # 24 hours
 INSTAGRAM_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60  # 24 hours
 INSTAGRAM_DEPRIORITIZE_CACHE_AGE_SECONDS = 24 * 60 * 60  # 24 hours
 MIN_CACHED_PROFILES_FOR_REDUCED_MODE = 11
 POEM_MAX_LINES = 7
 MAX_PROMPT_POSTS_PER_ACCOUNT = 2
+MAX_IMAGE_POSTS_PER_ACCOUNT = 2
 MAX_PROMPT_CAPTION_CHARS = 280
+MAX_IMAGE_OCR_CHARS = 500
 POEM_STYLES = [
     "Rumi",
     "Mary Oliver",
@@ -86,6 +93,9 @@ class Post:
     taken_at_timestamp: int | None
     caption: str
     shortcode: str
+    is_carousel: bool = False
+    image_urls: list[str] = field(default_factory=list)
+    image_ocr_texts: list[str] = field(default_factory=list)
 
     @property
     def post_url(self) -> str:
@@ -98,6 +108,24 @@ class Post:
         return datetime.fromtimestamp(
             self.taken_at_timestamp, tz=timezone.utc
         ).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+@dataclass
+class ImageOcrStats:
+    accounts_scanned: int = 0
+    posts_scanned: int = 0
+    image_urls_seen: int = 0
+    cache_hits: int = 0
+    vision_calls: int = 0
+    text_snippets_collected: int = 0
+
+    def add(self, other: "ImageOcrStats") -> None:
+        self.accounts_scanned += other.accounts_scanned
+        self.posts_scanned += other.posts_scanned
+        self.image_urls_seen += other.image_urls_seen
+        self.cache_hits += other.cache_hits
+        self.vision_calls += other.vision_calls
+        self.text_snippets_collected += other.text_snippets_collected
 
 
 def ensure_profiles_file():
@@ -166,6 +194,17 @@ def _cache_file_for_username(username: str) -> Path:
 def _extraction_cache_file_for_username(username: str) -> Path:
     safe_username = re.sub(r"[^a-zA-Z0-9_.-]", "_", username)
     return INSTAGRAM_EXTRACTION_CACHE_DIR / f"{safe_username}.json"
+
+
+def _image_text_cache_file_for_url(image_url: str) -> Path:
+    digest = hashlib.sha256(image_url.encode("utf-8")).hexdigest()
+    return INSTAGRAM_IMAGE_TEXT_CACHE_DIR / f"{digest}.json"
+
+
+def _carousel_summary_cache_file_for_post(username: str, shortcode: str) -> Path:
+    safe_username = re.sub(r"[^a-zA-Z0-9_.-]", "_", username)
+    safe_shortcode = re.sub(r"[^a-zA-Z0-9_.-]", "_", shortcode)
+    return INSTAGRAM_CAROUSEL_SUMMARY_CACHE_DIR / f"{safe_username}_{safe_shortcode}.json"
 
 
 def _write_profile_cache(username: str, profile_json: dict[str, Any]) -> None:
@@ -257,6 +296,60 @@ def prune_old_extraction_cache_files(max_age_seconds: int) -> int:
     return deleted
 
 
+def prune_old_image_text_cache_files(max_age_seconds: int) -> int:
+    if not INSTAGRAM_IMAGE_TEXT_CACHE_DIR.exists():
+        return 0
+
+    deleted = 0
+    now = int(time.time())
+    for cache_file in INSTAGRAM_IMAGE_TEXT_CACHE_DIR.glob("*.json"):
+        should_delete = False
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            fetched_at = int(payload.get("fetched_at", 0))
+            if fetched_at <= 0:
+                fetched_at = int(cache_file.stat().st_mtime)
+            should_delete = (now - fetched_at) > max_age_seconds
+        except Exception:
+            should_delete = True
+
+        if should_delete:
+            try:
+                cache_file.unlink()
+                deleted += 1
+            except OSError:
+                pass
+
+    return deleted
+
+
+def prune_old_carousel_summary_cache_files(max_age_seconds: int) -> int:
+    if not INSTAGRAM_CAROUSEL_SUMMARY_CACHE_DIR.exists():
+        return 0
+
+    deleted = 0
+    now = int(time.time())
+    for cache_file in INSTAGRAM_CAROUSEL_SUMMARY_CACHE_DIR.glob("*.json"):
+        should_delete = False
+        try:
+            payload = json.loads(cache_file.read_text(encoding="utf-8"))
+            fetched_at = int(payload.get("fetched_at", 0))
+            if fetched_at <= 0:
+                fetched_at = int(cache_file.stat().st_mtime)
+            should_delete = (now - fetched_at) > max_age_seconds
+        except Exception:
+            should_delete = True
+
+        if should_delete:
+            try:
+                cache_file.unlink()
+                deleted += 1
+            except OSError:
+                pass
+
+    return deleted
+
+
 def rotate_profiles_for_fetch_priority(
     profile_urls: list[str], *, verbose: bool = True
 ) -> list[str]:
@@ -296,7 +389,12 @@ def rotate_profiles_for_fetch_priority(
     return rotated
 
 
-def extract_recent_posts(profile_json: dict[str, Any], username: str, lookback_days: int) -> list[Post]:
+def extract_recent_posts(
+    profile_json: dict[str, Any],
+    username: str,
+    lookback_days: int,
+    include_images: bool = False,
+) -> list[Post]:
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     cutoff_ts = int(cutoff.timestamp())
 
@@ -307,7 +405,7 @@ def extract_recent_posts(profile_json: dict[str, Any], username: str, lookback_d
         .get("edges", [])
     )
 
-    posts: list[Post] = []
+    posts_with_nodes: list[tuple[Post, dict[str, Any]]] = []
     for edge in edges:
         node = edge.get("node", {})
         ts = node.get("taken_at_timestamp")
@@ -323,17 +421,56 @@ def extract_recent_posts(profile_json: dict[str, Any], username: str, lookback_d
         if not shortcode:
             continue
 
-        posts.append(
-            Post(
-                username=username,
-                taken_at_timestamp=ts,
-                caption=caption.strip(),
-                shortcode=shortcode,
-            )
+        post = Post(
+            username=username,
+            taken_at_timestamp=ts,
+            caption=caption.strip(),
+            shortcode=shortcode,
+            is_carousel=(str(node.get("__typename", "")) == "GraphSidecar"),
         )
+        posts_with_nodes.append((post, node))
 
-    posts.sort(key=lambda p: p.taken_at_timestamp)
+    posts_with_nodes.sort(key=lambda p: p[0].taken_at_timestamp)
+    posts: list[Post] = [post for post, _ in posts_with_nodes]
+
+    if not include_images:
+        return posts
+
+    # Attach image URLs only for the N most recent posts in lookback.
+    recent_shortcodes = {
+        post.shortcode for post in posts[-MAX_IMAGE_POSTS_PER_ACCOUNT:]
+    }
+    for post, node in posts_with_nodes:
+        if post.shortcode not in recent_shortcodes:
+            continue
+        post.image_urls = _extract_image_urls_from_node(node)
+
     return posts
+
+
+def _extract_image_urls_from_node(node: dict[str, Any]) -> list[str]:
+    typename = str(node.get("__typename", ""))
+    if typename == "GraphVideo" or bool(node.get("is_video")):
+        return []
+
+    urls: list[str] = []
+    if typename == "GraphSidecar":
+        child_edges = node.get("edge_sidecar_to_children", {}).get("edges", [])
+        for child_edge in child_edges:
+            child = child_edge.get("node", {})
+            child_typename = str(child.get("__typename", ""))
+            if child_typename == "GraphVideo" or bool(child.get("is_video")):
+                continue
+            url = str(child.get("display_url", "")).strip()
+            if url:
+                urls.append(url)
+        return urls
+
+    # GraphImage or unknown non-video node fallback.
+    url = str(node.get("display_url", "")).strip()
+    if url:
+        urls.append(url)
+    return urls
 
 
 def _trim_caption(caption: str) -> str:
@@ -347,6 +484,13 @@ def _trim_quote(text: str, max_words: int = 20) -> str:
     words = (text or "").split()
     if not words:
         return ""
+    if len(words) <= max_words:
+        return " ".join(words)
+    return " ".join(words[:max_words]).rstrip() + "..."
+
+
+def _trim_words(text: str, max_words: int) -> str:
+    words = (text or "").split()
     if len(words) <= max_words:
         return " ".join(words)
     return " ".join(words[:max_words]).rstrip() + "..."
@@ -389,11 +533,16 @@ def _build_account_extraction_prompt(username: str, posts: list[Post], lookback_
         lines.append(f"DATE: {post.taken_at_iso}")
         lines.append(f"POST URL: {post.post_url}")
         lines.append(f"CAPTION: {_trim_caption(post.caption)}")
+        if post.image_ocr_texts:
+            for image_text in post.image_ocr_texts:
+                lines.append(f"IMAGE_TEXT: {_trim_caption(image_text)}")
+        else:
+            lines.append("IMAGE_TEXT: [No extracted image text]")
         lines.append("---")
     body = "\n".join(lines)
     return f"""
 Extract structured updates from this single Instagram account.
-Only use facts present in the captions below.
+Only use facts present in the captions and IMAGE_TEXT below.
 Do not invent events, dates, locations, or offerings.
 Prioritize concrete updates (events, deadlines, announcements, new offerings).
 
@@ -534,11 +683,474 @@ def _write_account_extraction_cache(
         return
 
 
+def _download_image_bytes(
+    image_url: str, use_timeouts: bool
+) -> tuple[bytes | None, str | None]:
+    request_timeout = INSTAGRAM_REQUEST_TIMEOUT_SECONDS if use_timeouts else None
+    try:
+        response = requests.get(
+            image_url,
+            headers=INSTAGRAM_REQUEST_HEADERS,
+            timeout=request_timeout,
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type")
+        data = response.content
+        if not data:
+            return None, content_type
+        if content_type and not content_type.lower().startswith("image/"):
+            return None, content_type
+        return data, content_type
+    except Exception:
+        return None, None
+
+
+def _read_image_text_cache(image_url: str, model: str) -> tuple[str | None, str]:
+    cache_file = _image_text_cache_file_for_url(image_url)
+    if not cache_file.exists():
+        return None, ""
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None, ""
+    if not isinstance(payload, dict):
+        return None, ""
+    if str(payload.get("model", "")) != model:
+        return None, ""
+    kind = str(payload.get("kind", "")).strip().lower()
+    content = str(payload.get("content", "")).strip()
+    if kind not in {"text", "none"}:
+        return None, ""
+    return kind, content
+
+
+def _write_image_text_cache(
+    image_url: str, model: str, kind: str, content: str
+) -> None:
+    try:
+        INSTAGRAM_IMAGE_TEXT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "image_url": image_url,
+            "model": model,
+            "kind": kind,
+            "content": content,
+            "fetched_at": int(time.time()),
+        }
+        _image_text_cache_file_for_url(image_url).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        return
+
+
+def _carousel_summary_signature(snippets: list[str]) -> str:
+    raw = json.dumps(snippets, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _read_carousel_summary_cache(
+    *,
+    username: str,
+    shortcode: str,
+    snippets: list[str],
+    model: str,
+) -> str | None:
+    cache_file = _carousel_summary_cache_file_for_post(username, shortcode)
+    if not cache_file.exists():
+        return None
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("model", "")) != model:
+        return None
+    if str(payload.get("signature", "")) != _carousel_summary_signature(snippets):
+        return None
+    summary = str(payload.get("summary", "")).strip()
+    if not summary:
+        return None
+    return summary
+
+
+def _write_carousel_summary_cache(
+    *,
+    username: str,
+    shortcode: str,
+    snippets: list[str],
+    model: str,
+    summary: str,
+) -> None:
+    if not summary.strip():
+        return
+    try:
+        INSTAGRAM_CAROUSEL_SUMMARY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "username": username,
+            "shortcode": shortcode,
+            "model": model,
+            "signature": _carousel_summary_signature(snippets),
+            "summary": summary,
+            "fetched_at": int(time.time()),
+        }
+        _carousel_summary_cache_file_for_post(username, shortcode).write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception:
+        return
+
+
+def _extract_ollama_image_content(data: dict[str, Any]) -> str:
+    message = data.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        text = message.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    response = data.get("response")
+    if isinstance(response, str) and response.strip():
+        return response.strip()
+    choices = data.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            msg = choice.get("message")
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+            text = choice.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    return ""
+
+
+def _log_ollama_image_error(endpoint: str, model: str, task_label: str, err: Exception) -> None:
+    message = f"[{model}] Ollama image call failed on {endpoint} for {task_label}: {err}"
+    if isinstance(err, requests.HTTPError) and err.response is not None:
+        status = err.response.status_code
+        body = (err.response.text or "").strip().replace("\n", " ")
+        if len(body) > 300:
+            body = body[:300].rstrip() + "..."
+        message += f" (status={status}, body={body})"
+    print(message, file=sys.stderr)
+    print(
+        f"[{model}] If this model is not installed, run: ollama pull {model}",
+        file=sys.stderr,
+    )
+
+
+def _ask_ollama_with_image(
+    prompt: str,
+    image_bytes: bytes,
+    *,
+    model: str,
+    use_timeouts: bool,
+    task_label: str,
+    verbose: bool,
+) -> str:
+    if verbose:
+        print(
+            f"[{model}] Running image model for {task_label}",
+            file=sys.stderr,
+        )
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": [base64.b64encode(image_bytes).decode("utf-8")],
+            }
+        ],
+        "stream": False,
+        "keep_alive": "10m",
+    }
+    request_timeout = OLLAMA_TIMEOUT_SECONDS if use_timeouts else None
+    try:
+        response = requests.post(OLLAMA_URL, json=payload, timeout=request_timeout)
+        response.raise_for_status()
+        data = response.json()
+    except Exception as e:
+        _log_ollama_image_error("/api/chat", model, task_label, e)
+        raise
+    content = _extract_ollama_image_content(data)
+    if verbose and content:
+        print(
+            f"[{model}] Image model returned content via /api/chat for {task_label}",
+            file=sys.stderr,
+        )
+    if verbose and not content:
+        print(
+            f"[{model}] Image model returned empty content for {task_label}",
+            file=sys.stderr,
+        )
+        try:
+            top_keys = sorted(data.keys())
+            print(
+                f"[{model}] Image model response keys for {task_label}: {top_keys}",
+                file=sys.stderr,
+            )
+            if "message" in data and isinstance(data["message"], dict):
+                msg_keys = sorted(data["message"].keys())
+                print(
+                    f"[{model}] message keys for {task_label}: {msg_keys}",
+                    file=sys.stderr,
+                )
+        except Exception:
+            pass
+    return content
+
+
+def _extract_text_from_image_or_none(
+    image_bytes: bytes, *, use_timeouts: bool, verbose: bool
+) -> tuple[str, str]:
+    prompt = (
+        "Analyze this image and return JSON only with this schema: "
+        '{"kind":"text|none","content":"..."} . '
+        "If readable text is present, set kind to text and put only the extracted text in content. "
+        "If no readable text is present, set kind to none and content to an empty string."
+    )
+    try:
+        raw = _ask_ollama_with_image(
+            prompt,
+            image_bytes,
+            model=IMAGE_TEXT_OLLAMA_MODEL,
+            use_timeouts=use_timeouts,
+            task_label="image text extraction",
+            verbose=verbose,
+        )
+    except Exception:
+        return "none", ""
+
+    parsed = _extract_json_object(raw)
+    if isinstance(parsed, dict):
+        kind = str(parsed.get("kind", "")).strip().lower()
+        content = str(parsed.get("content", "")).strip()
+        if kind in {"text", "none"}:
+            if kind == "text" and len(content) > MAX_IMAGE_OCR_CHARS:
+                content = content[:MAX_IMAGE_OCR_CHARS].rstrip() + "..."
+            if kind == "none":
+                return "none", ""
+            return kind, content
+
+    # Fallback: treat non-empty raw output as extracted text.
+    fallback = " ".join(raw.split())
+    if not fallback:
+        return "none", ""
+    if len(fallback) > MAX_IMAGE_OCR_CHARS:
+        fallback = fallback[:MAX_IMAGE_OCR_CHARS].rstrip() + "..."
+    if verbose:
+        print(
+            "Image text extraction fallback used: non-JSON response treated as text.",
+            file=sys.stderr,
+        )
+    return "text", fallback
+
+
+def _summarize_carousel_image_texts(
+    snippets: list[str],
+    *,
+    username: str,
+    shortcode: str,
+    use_timeouts: bool,
+    verbose: bool,
+) -> str:
+    if not snippets:
+        return ""
+    cached = _read_carousel_summary_cache(
+        username=username,
+        shortcode=shortcode,
+        snippets=snippets,
+        model=IMAGE_TEXT_SUMMARY_OLLAMA_MODEL,
+    )
+    if cached is not None:
+        if verbose:
+            print(
+                f"Using cached carousel IMAGE_TEXT summary for @{username} post {shortcode}.",
+                file=sys.stderr,
+            )
+        return cached
+
+    joined = "\n".join(f"- {s}" for s in snippets)
+    prompt = f"""
+Summarize extracted text from a single Instagram carousel post.
+Prioritize concrete dates, times, deadlines, and locations.
+Preserve specific names and offerings when present.
+Do not invent details.
+Output one concise line no longer than 80 words.
+
+Account: @{username}
+Post shortcode: {shortcode}
+Extracted image text snippets:
+{joined}
+""".strip()
+    try:
+        summary = ask_ollama(
+            prompt,
+            model=IMAGE_TEXT_SUMMARY_OLLAMA_MODEL,
+            task_label=f"carousel image text summary @{username}",
+            use_timeouts=use_timeouts,
+            estimated_output_tokens=120,
+            verbose=verbose,
+        ).strip()
+    except Exception:
+        summary = ""
+
+    summary = " ".join(summary.split())
+    if len(summary) > MAX_IMAGE_OCR_CHARS:
+        summary = summary[:MAX_IMAGE_OCR_CHARS].rstrip() + "..."
+    _write_carousel_summary_cache(
+        username=username,
+        shortcode=shortcode,
+        snippets=snippets,
+        model=IMAGE_TEXT_SUMMARY_OLLAMA_MODEL,
+        summary=summary,
+    )
+    return summary
+
+
+def _populate_image_ocr_for_posts(
+    posts: list[Post], *, include_images: bool, use_timeouts: bool, verbose: bool
+) -> ImageOcrStats:
+    stats = ImageOcrStats()
+    if not include_images:
+        return stats
+    stats.accounts_scanned = 1
+    for post in posts[-MAX_PROMPT_POSTS_PER_ACCOUNT:]:
+        stats.posts_scanned += 1
+        if not post.image_urls:
+            continue
+        extracted_for_post: list[str] = []
+        for image_url in post.image_urls:
+            stats.image_urls_seen += 1
+            image_bytes: bytes | None = None
+            image_content_type: str | None = None
+            cached_kind, cached_content = _read_image_text_cache(
+                image_url, IMAGE_TEXT_OLLAMA_MODEL
+            )
+            if cached_kind is not None:
+                stats.cache_hits += 1
+                if cached_kind == "text" and cached_content:
+                    extracted_for_post.append(cached_content)
+                    stats.text_snippets_collected += 1
+                    if verbose:
+                        print(
+                            "Image text (cached): "
+                            f"{_trim_words(cached_content, 40)}",
+                            file=sys.stderr,
+                        )
+                elif verbose:
+                    print("Image text result (cached): [none]", file=sys.stderr)
+                continue
+
+            image_bytes, image_content_type = _download_image_bytes(
+                image_url, use_timeouts=use_timeouts
+            )
+            if verbose:
+                print(
+                    "Image fetch: "
+                    f"content_type={image_content_type or 'unknown'}, "
+                    f"bytes={len(image_bytes) if image_bytes else 0}",
+                    file=sys.stderr,
+                )
+            if not image_bytes:
+                continue
+
+            stats.vision_calls += 1
+            kind, content = _extract_text_from_image_or_none(
+                image_bytes,
+                use_timeouts=use_timeouts,
+                verbose=verbose,
+            )
+            _write_image_text_cache(
+                image_url, IMAGE_TEXT_OLLAMA_MODEL, kind, content
+            )
+            if kind == "text" and content:
+                extracted_for_post.append(content)
+                stats.text_snippets_collected += 1
+                if verbose:
+                    print(
+                        "Image text: "
+                        f"{_trim_words(content, 40)}",
+                        file=sys.stderr,
+                    )
+            elif verbose:
+                print("Image text result: [none]", file=sys.stderr)
+        if post.is_carousel and len(extracted_for_post) > 1:
+            summarized = _summarize_carousel_image_texts(
+                extracted_for_post,
+                username=post.username,
+                shortcode=post.shortcode,
+                use_timeouts=use_timeouts,
+                verbose=verbose,
+            )
+            if summarized:
+                extracted_for_post = [summarized]
+                if verbose:
+                    print(
+                        "Carousel IMAGE_TEXT summary: "
+                        f"{_trim_words(summarized, 40)}",
+                        file=sys.stderr,
+                    )
+
+        post.image_ocr_texts = extracted_for_post
+        if verbose and extracted_for_post:
+            print(
+                f"Image OCR extracted text for @{post.username} post {post.shortcode}: "
+                f"{len(extracted_for_post)} image(s) with text.",
+                file=sys.stderr,
+            )
+    return stats
+
+
+def _run_phase_0_5_image_ocr(
+    posts_by_user: dict[str, list[Post]],
+    *,
+    include_images: bool,
+    use_timeouts: bool,
+    verbose: bool,
+) -> ImageOcrStats:
+    aggregate = ImageOcrStats()
+    if not include_images:
+        return aggregate
+
+    account_usernames = [u for u, posts in posts_by_user.items() if posts]
+    print(
+        f"\nPhase 0.5: processing image OCR for {len(account_usernames)} account(s).",
+        file=sys.stderr,
+    )
+    for username in account_usernames:
+        per_account = _populate_image_ocr_for_posts(
+            posts_by_user[username],
+            include_images=True,
+            use_timeouts=use_timeouts,
+            verbose=verbose,
+        )
+        aggregate.add(per_account)
+
+    print(
+        "Phase 0.5 summary: "
+        f"posts_scanned={aggregate.posts_scanned}, "
+        f"image_urls_seen={aggregate.image_urls_seen}, "
+        f"cache_hits={aggregate.cache_hits}, "
+        f"vision_calls={aggregate.vision_calls}, "
+        f"text_snippets_collected={aggregate.text_snippets_collected}.",
+        file=sys.stderr,
+    )
+    return aggregate
+
+
 def _extract_account_facts(
     posts_by_user: dict[str, list[Post]],
     lookback_days: int,
     use_timeouts: bool,
     verbose: bool,
+    include_images: bool,
 ) -> dict[str, list[dict[str, str]]]:
     facts_by_user: dict[str, list[dict[str, str]]] = {}
     account_usernames = [u for u, posts in posts_by_user.items() if posts]
@@ -569,6 +1181,7 @@ def _extract_account_facts(
                     file=sys.stderr,
                 )
             continue
+
         if cache_status in cache_miss_reasons:
             cache_miss_reasons[cache_status] += 1
         if verbose:
@@ -954,6 +1567,7 @@ def _get_model_context_length(
 def generate_newsletter(
     use_timeouts: bool = True,
     verbose: bool = False,
+    include_images: bool = False,
 ) -> tuple[str, float, int, int, str, str, str]:
     ensure_profiles_file()
     pruned_cache_files = prune_old_profile_cache_files(
@@ -962,11 +1576,27 @@ def generate_newsletter(
     pruned_extraction_cache_files = prune_old_extraction_cache_files(
         INSTAGRAM_CACHE_MAX_AGE_SECONDS
     )
+    pruned_image_text_cache_files = prune_old_image_text_cache_files(
+        INSTAGRAM_CACHE_MAX_AGE_SECONDS
+    )
+    pruned_carousel_summary_cache_files = prune_old_carousel_summary_cache_files(
+        INSTAGRAM_CACHE_MAX_AGE_SECONDS
+    )
     if pruned_cache_files:
         print(f"Pruned {pruned_cache_files} old Instagram cache file(s).", file=sys.stderr)
     if pruned_extraction_cache_files:
         print(
             f"Pruned {pruned_extraction_cache_files} old extraction cache file(s).",
+            file=sys.stderr,
+        )
+    if pruned_image_text_cache_files:
+        print(
+            f"Pruned {pruned_image_text_cache_files} old image text cache file(s).",
+            file=sys.stderr,
+        )
+    if pruned_carousel_summary_cache_files:
+        print(
+            f"Pruned {pruned_carousel_summary_cache_files} old carousel summary cache file(s).",
             file=sys.stderr,
         )
 
@@ -1039,7 +1669,12 @@ def generate_newsletter(
                 if reduced_data_mode:
                     profile_json = fresh_cache_by_username.get(username)
                     if profile_json is not None:
-                        posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
+                        posts = extract_recent_posts(
+                            profile_json,
+                            username,
+                            LOOKBACK_DAYS,
+                            include_images=include_images,
+                        )
                         posts_by_user[username] = posts
                         cached_data_accounts.add(username)
                         if verbose:
@@ -1057,7 +1692,12 @@ def generate_newsletter(
 
                 profile_json = fresh_cache_by_username.get(username)
                 if profile_json is not None:
-                    posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
+                    posts = extract_recent_posts(
+                        profile_json,
+                        username,
+                        LOOKBACK_DAYS,
+                        include_images=include_images,
+                    )
                     posts_by_user[username] = posts
                     cached_data_accounts.add(username)
                     if verbose:
@@ -1073,7 +1713,12 @@ def generate_newsletter(
                     username, session=instagram_session, use_timeouts=use_timeouts
                 )
                 _write_profile_cache(username, profile_json)
-                posts = extract_recent_posts(profile_json, username, LOOKBACK_DAYS)
+                posts = extract_recent_posts(
+                    profile_json,
+                    username,
+                    LOOKBACK_DAYS,
+                    include_images=include_images,
+                )
                 posts_by_user[username] = posts
                 live_data_accounts.add(username)
 
@@ -1100,7 +1745,12 @@ def generate_newsletter(
                         username, max_age_seconds=INSTAGRAM_CACHE_MAX_AGE_SECONDS
                     )
                     if stale_profile_json is not None:
-                        posts = extract_recent_posts(stale_profile_json, username, LOOKBACK_DAYS)
+                        posts = extract_recent_posts(
+                            stale_profile_json,
+                            username,
+                            LOOKBACK_DAYS,
+                            include_images=include_images,
+                        )
                         posts_by_user[username] = posts
                         cached_data_accounts.add(username)
                         consecutive_401_errors = 0
@@ -1159,11 +1809,20 @@ def generate_newsletter(
             f"{len(cached_data_accounts)} cached.",
             file=sys.stderr,
         )
+
+    _run_phase_0_5_image_ocr(
+        posts_by_user,
+        include_images=include_images,
+        use_timeouts=use_timeouts,
+        verbose=verbose,
+    )
+
     facts_by_user = _extract_account_facts(
         posts_by_user,
         LOOKBACK_DAYS,
         use_timeouts=use_timeouts,
         verbose=verbose,
+        include_images=include_images,
     )
     total_extracted_items = sum(len(items) for items in facts_by_user.values())
     if verbose:
@@ -1229,6 +1888,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print verbose logs, including full Phase 1 extracted JSON.",
     )
+    parser.add_argument(
+        "--include-images",
+        action="store_true",
+        help="Include image URL extraction for up to the 2 most recent in-lookback posts per account.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1246,6 +1910,7 @@ def main(argv: list[str] | None = None) -> int:
         ) = generate_newsletter(
             use_timeouts=not args.no_timeouts,
             verbose=args.verbose,
+            include_images=args.include_images,
         )
     except Exception as e:
         print(str(e), file=sys.stderr)

@@ -231,6 +231,7 @@ def send_newsletter_to_readwise(
 def run_newsletter_to_readwise(
     no_timeouts: bool = False,
     verbose: bool = False,
+    include_images: bool = False,
 ) -> int:
     token = os.getenv("READWISE_ACCESS_TOKEN")
     if not token:
@@ -253,6 +254,7 @@ def run_newsletter_to_readwise(
         ) = generate_newsletter(
             use_timeouts=not no_timeouts,
             verbose=verbose,
+            include_images=include_images,
         )
     except Exception as e:
         print(f"Newsletter generation failed: {e}")
@@ -304,6 +306,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Print verbose logs, including full Phase 1 extracted JSON.",
     )
+    parser.add_argument(
+        "--include-images",
+        action="store_true",
+        help="Include image URL extraction for up to the 2 most recent in-lookback posts per account.",
+    )
     return parser.parse_args(argv)
 
 
@@ -313,5 +320,6 @@ if __name__ == "__main__":
         run_newsletter_to_readwise(
             no_timeouts=args.no_timeouts,
             verbose=args.verbose,
+            include_images=args.include_images,
         )
     )

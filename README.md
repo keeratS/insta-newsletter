@@ -110,6 +110,15 @@ This script will:
 - generate a short poem (max 7 lines), with random inspiration style per run
 - print runtime stats (generation time, model used, accounts checked, accounts with recent posts)
 
+Image analysis note:
+
+- by default, image analysis is OFF
+- this is intentional because image analysis can take a long time on local hardware
+- to enable image text extraction, run:
+  - `python insta_newsletter.py --include-images`
+  - `python send_readwise_insta_newsletter.py --include-images`
+- when enabled, the script analyzes image text from up to the 2 most recent in-window posts per account (ignoring video media)
+
 Timeout note:
 
 - larger Ollama models can take much longer on some laptops, depending on CPU/GPU/RAM
@@ -151,6 +160,7 @@ Cache behavior:
 
 - cache location: `.cache/instagram_profiles/`
 - phase-1 extraction cache location: `.cache/instagram_extractions/`
+- image text cache location: `.cache/instagram_image_text/`
 - fresh cache lifetime: 24 hours
 - if a live request returns `401`, the script can use stale cache up to 24 hours old for that profile
 - cache files older than this window are cleaned up automatically during runs
