@@ -34,12 +34,19 @@
 This week’s highlights blend creativity, community, and curiosity. From art openings to nature quizzes, there’s something for every interest. Stay tuned for more local happenings and don’t miss the chance to engage with your neighborhood! 🌿📚☕
 
 POEM (Mary Oliver inspired):
+
 Tea with the Bridgertons steams in a cup of wonder,
+
 a bird quiz hums in Quebec’s quiet woods.
+
 NASA’s young sun blazes in a cosmic sigh—
+
 goat cheese balls answer the salad’s call.
+
 Camp hosts tend fireflies, while stories bloom
+
 beneath the opera’s ring.
+
 Curiosity, a compass, guides the way.
 
 ---
