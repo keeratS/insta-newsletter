@@ -34,6 +34,8 @@ Example use cases:
 
 ## Example Output
 
+See a full sample here: [example newsletter](./example_newsletter.md).
+
 TITLE:
 Bay Area Literary & Community Updates
 
@@ -110,7 +112,14 @@ This script will:
 - generate a short poem (max 7 lines), with random inspiration style per run
 - print runtime stats (generation time, model used, accounts checked, accounts with recent posts)
 
-Image analysis note:
+Run the Readwise wrapper:
+```
+python send_readwise_insta_newsletter.py
+```
+
+---
+
+## Image Analysis
 
 - by default, image analysis is OFF
 - this is intentional because image analysis can take a long time on local hardware
@@ -118,8 +127,11 @@ Image analysis note:
   - `python insta_newsletter.py --include-images`
   - `python send_readwise_insta_newsletter.py --include-images`
 - when enabled, the script analyzes image text from up to the 2 most recent in-window posts per account (ignoring video media)
+- for carousel posts, extracted text from multiple carousel images is condensed into a single IMAGE_TEXT summary (prioritizing dates/locations) before newsletter extraction
 
-Timeout note:
+---
+
+## Performance & Timeouts
 
 - larger Ollama models can take much longer on some laptops, depending on CPU/GPU/RAM
 - if generation runs into timeout errors on your hardware, rerun with:
@@ -161,6 +173,8 @@ Cache behavior:
 - cache location: `.cache/instagram_profiles/`
 - phase-1 extraction cache location: `.cache/instagram_extractions/`
 - image text cache location: `.cache/instagram_image_text/`
+- carousel image-text summary cache location: `.cache/instagram_carousel_summaries/`
+- Ollama model-info cache location: `.cache/ollama_model_info.json`
 - fresh cache lifetime: 24 hours
 - if a live request returns `401`, the script can use stale cache up to 24 hours old for that profile
 - cache files older than this window are cleaned up automatically during runs
@@ -173,9 +187,11 @@ Fetch strategy:
 
 Manual reset:
 
-- delete `.cache/instagram_profiles` to clear cache manually
+- delete `.cache/instagram_profiles` to clear profile cache manually
 - delete `.cache/instagram_extractions` to clear phase-1 extraction cache manually
-- if you change extraction prompt or extraction JSON format, clear both cache folders before running again
+- delete `.cache/instagram_image_text` to clear image text cache manually
+- delete `.cache/instagram_carousel_summaries` to clear carousel summary cache manually
+- if you change extraction prompt or extraction JSON format, clear related cache folders before running again
 - the folder is recreated automatically on the next run
 
 ---
@@ -203,14 +219,19 @@ Note: this is especially useful when your profile list is long and Instagram thr
 
 ---
 
-## Notes
+## Model Notes
 
-- This project summarizes captions only.
-- Image analysis could be added using a multimodal model such as qwen2.5vl.
-- Instagram endpoints may change over time.
+- newsletter model: `qwen3:8b`
+- poem model: `qwen3:8b`
+- image text model (when `--include-images` is enabled): `qwen2.5vl:7b`
 - currently tested with qwen3:8b, qwen3:14b, gemma3:12b on macbook m4 pro
 - at time of testing, gemma outputs were generally less useful than qwen outputs for this newsletter task
-- the newsletter may incorrectly attribute things from one post to a different account. in testing this happened for 2/40 events. 
+
+---
+
+## Notes
+
+- Instagram endpoints may change over time.
 
 ---
 
