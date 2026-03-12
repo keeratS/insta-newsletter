@@ -74,9 +74,14 @@ git clone https://github.com/keeratS/insta-newsletter.git
 cd insta-newsletter
 ```
 ### Create a virtual environment
+mac/linux
 ```
 python3 -m venv venv
 source venv/bin/activate
+```
+on windows:
+```
+source venv/Scripts/activate
 ```
 ### Install dependencies
 ```
